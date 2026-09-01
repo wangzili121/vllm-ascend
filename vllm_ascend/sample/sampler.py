@@ -15,6 +15,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_s
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 
 _SAMPLING_EPS = 1e-5
+_BATCHED_EXPONENTIAL_MIN_BATCH_SIZE = 16
 
 
 def random_sample(
@@ -32,13 +33,23 @@ def random_sample(
     # that have their own seeds.
     with npu_stream_switch(global_stream()):
         q = torch.empty_like(probs)
-        if len(generators) != probs.shape[0]:
-            q.exponential_()
-        if generators:
-            # TODO(woosuk): This can be slow because we handle each request
-            # one by one. Optimize this.
+        batch_seeded = (
+            len(generators) == probs.shape[0]
+            and len(generators) >= _BATCHED_EXPONENTIAL_MIN_BATCH_SIZE
+        )
+        if batch_seeded:
             for i, generator in generators.items():
-                q[i].exponential_(generator=generator)
+                q[i].uniform_(generator=generator)
+            q.neg_().add_(1.0)
+            eps = torch.finfo(q.dtype).eps / 2
+            q.masked_fill_(q >= (1.0 - eps), 1.0 - eps).log_().neg_()
+        else:
+            q.exponential_()
+            if generators:
+                # TODO(woosuk): This can be slow because we handle each request
+                # one by one. Optimize this.
+                for i, generator in generators.items():
+                    q[i].exponential_(generator=generator)
     torch.npu.current_stream().wait_stream(global_stream())
     q.record_stream(torch.npu.current_stream())
     return probs.div_(q).argmax(dim=-1).view(-1)
