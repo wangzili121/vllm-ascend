@@ -7,8 +7,11 @@ import vllm.config.speculative as speculative_config
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
 
+from vllm_ascend.spec_decode.custom_class_proposer import is_custom_class_method
+
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
+_orig_repr = SpeculativeConfig.__repr__
 
 # Transformers 5.14 inherited a hidden_size % num_heads check from Llama in
 # DeepseekV2Config. K3 MLA has independent projection/head dimensions (e.g.
@@ -102,6 +105,10 @@ def _temporarily_disable_dspark_dcp(self: SpeculativeConfig):
 
 
 def _dspark_post_init(self):
+    if is_custom_class_method(self):
+        _custom_class_post_init(self)
+        return
+
     # TODO: This block can be deleted after the upstream supports the overlay of mla dcp and dspark
     with _temporarily_disable_dspark_dcp(self):
         _orig_post_init(self)
@@ -117,8 +124,47 @@ def _dspark_post_init(self):
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
 
 
+def _custom_class_post_init(self: SpeculativeConfig):
+    if getattr(self, "model", None) is None:
+        raise ValueError("custom_class speculative config requires model")
+    if getattr(self, "num_speculative_tokens", None) is None:
+        raise ValueError(
+            "custom_class speculative config requires num_speculative_tokens"
+        )
+
+    self.prompt_lookup_max = 0
+    self.prompt_lookup_min = 0
+    self.draft_model_config = None
+    self.draft_parallel_config = None
+
+
+def _patch_custom_class_method_type():
+    SpeculativeConfig.__annotations__["method"] = str | None
+    SpeculativeConfig.__dataclass_fields__["method"].type = str | None
+
+
+def _rebuild_speculative_config_dataclass():
+    try:
+        from pydantic.dataclasses import rebuild_dataclass
+    except ImportError:
+        return
+    rebuild_dataclass(SpeculativeConfig, force=True)
+
+
+def _custom_class_repr(self: SpeculativeConfig):
+    if not is_custom_class_method(self):
+        return _orig_repr(self)
+    method = self.method
+    model = self.model
+    num_spec_tokens = self.num_speculative_tokens
+    return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
+
+
 SpeculativeConfig.hf_config_override = staticmethod(_normalize_legacy_qwen3_dspark_config)
+_patch_custom_class_method_type()
 SpeculativeConfig.__post_init__ = _dspark_post_init
+SpeculativeConfig.__repr__ = _custom_class_repr
+_rebuild_speculative_config_dataclass()
 
 if "glm5_next_mtp" not in get_args(speculative_config.MTPModelTypes):
     speculative_config.MTPModelTypes = Literal[

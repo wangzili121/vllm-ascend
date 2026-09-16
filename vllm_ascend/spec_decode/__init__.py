@@ -17,7 +17,10 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
-
+from vllm_ascend.spec_decode.custom_class_proposer import (
+    CUSTOM_CLASS_METHOD,
+    create_custom_class_proposer,
+)
 from vllm_ascend.spec_decode.dflash2_proposer import AscendDflash2Proposer, is_dflash2_draft
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -35,7 +38,9 @@ from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
-    if method == "ngram":
+    if method == CUSTOM_CLASS_METHOD:
+        return create_custom_class_proposer(vllm_config)
+    elif method == "ngram":
         return AscendNgramProposer(vllm_config, runner)
     elif method == "ngram_gpu":
         return AscendNgramProposerNPU(vllm_config, device, runner)

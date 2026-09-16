@@ -66,6 +66,105 @@ class TestNPUWorker(TestBase):
         self.distributed_init_method = "tcp://localhost:12345"
         self.is_driver_worker = False
 
+    def test_custom_proposer_rpc_registers_against_active_request(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        class Proposer:
+            def __init__(self):
+                self.call = None
+
+            def register_draft_bundle(
+                self,
+                request_id,
+                draft_token_ids,
+                boundary_token_ids,
+                prompt_token_count,
+                candidate_metadata=None,
+                external_request_id=None,
+            ):
+                self.call = (
+                    request_id,
+                    draft_token_ids,
+                    boundary_token_ids,
+                    prompt_token_count,
+                    candidate_metadata,
+                    external_request_id,
+                )
+                return {
+                    "status": "ok",
+                    "registered": True,
+                    "draft_token_count": 2,
+                }
+
+        proposer = Proposer()
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = SimpleNamespace(
+            drafter=proposer,
+            requests={
+                "chatcmpl-req-0-abcd": SimpleNamespace(
+                    num_prompt_tokens=12,
+                )
+            },
+        )
+
+        result = worker.self_speculation_register_draft_bundle(
+            "req-0",
+            [[10, 11]],
+            [[9]],
+            candidate_metadata=[{"candidate_id": "c0"}],
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["registered"])
+        self.assertEqual(result["internal_request_id"], "chatcmpl-req-0-abcd")
+        self.assertEqual(
+            proposer.call,
+            (
+                "chatcmpl-req-0-abcd",
+                [[10, 11]],
+                [[9]],
+                12,
+                [{"candidate_id": "c0"}],
+                "req-0",
+            ),
+        )
+
+    def test_custom_proposer_rpc_reports_pending_for_inactive_request(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = SimpleNamespace(
+            drafter=SimpleNamespace(register_draft_bundle=MagicMock()),
+            requests={},
+        )
+
+        result = worker.self_speculation_register_draft_bundle(
+            "req-0",
+            [[10]],
+            [[9]],
+        )
+
+        self.assertEqual(result, {"status": "pending", "reason": "request_not_active"})
+
+    def test_custom_proposer_rpc_clear_and_status(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        proposer = SimpleNamespace(
+            clear_request=MagicMock(return_value={"status": "cleared"}),
+            status=MagicMock(return_value={"registrations": 1}),
+        )
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = SimpleNamespace(drafter=proposer)
+
+        self.assertEqual(
+            worker.self_speculation_clear_draft("req-0"),
+            {"status": "cleared"},
+        )
+        self.assertEqual(
+            worker.self_speculation_draft_status(),
+            {"status": "ok", "registrations": 1},
+        )
+
     def test_layer_reuse_memory_factor_merges_main_components(self):
         from vllm_ascend.core.kv_cache_interface import (
             AscendMLAAttentionSpec,

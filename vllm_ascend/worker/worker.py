@@ -93,6 +93,11 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+from vllm_ascend.spec_decode.custom_class_proposer import (
+    clear_custom_class_draft,
+    custom_class_draft_status,
+    register_custom_class_draft_bundle,
+)
 from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_sp,
@@ -513,6 +518,29 @@ class NPUWorker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def self_speculation_register_draft_bundle(
+        self,
+        request_id: str,
+        draft_token_ids: list[list[int]],
+        boundary_token_ids: list[list[int]],
+        prompt_token_count: int | None = None,
+        candidate_metadata: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return register_custom_class_draft_bundle(
+            self,
+            request_id,
+            draft_token_ids,
+            boundary_token_ids,
+            prompt_token_count,
+            candidate_metadata,
+        )
+
+    def self_speculation_clear_draft(self, request_id: str) -> dict[str, Any]:
+        return clear_custom_class_draft(self, request_id)
+
+    def self_speculation_draft_status(self) -> dict[str, Any]:
+        return custom_class_draft_status(self)
 
     def _apply_kv_offload_decode_memory_constraints(
         self,

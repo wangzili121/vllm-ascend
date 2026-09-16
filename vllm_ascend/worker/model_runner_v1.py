@@ -175,6 +175,10 @@ from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+from vllm_ascend.spec_decode.custom_class_proposer import (
+    is_custom_class_method,
+    set_custom_class_request_ids,
+)
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
@@ -316,6 +320,30 @@ def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
 
 
+@contextmanager
+def custom_class_base_runner_compat(vllm_config: VllmConfig):
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if not is_custom_class_method(speculative_config):
+        yield
+        return
+
+    saved = {
+        "method": speculative_config.method,
+        "model": speculative_config.model,
+        "prompt_lookup_min": getattr(speculative_config, "prompt_lookup_min", None),
+        "prompt_lookup_max": getattr(speculative_config, "prompt_lookup_max", None),
+    }
+    speculative_config.method = "ngram"
+    speculative_config.model = "ngram"
+    speculative_config.prompt_lookup_min = 1
+    speculative_config.prompt_lookup_max = 1
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(speculative_config, name, value)
+
+
 def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     """Count NaNs without the unsupported NPU ``sum(dtype=...)`` overload."""
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
@@ -354,7 +382,7 @@ class NPUModelRunner(GPUModelRunner):
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
 
-        with _torch_cuda_wrapper():
+        with _torch_cuda_wrapper(), custom_class_base_runner_compat(vllm_config):
             super().__init__(vllm_config, device)
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -1835,6 +1863,17 @@ class NPUModelRunner(GPUModelRunner):
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
+        elif is_custom_class_method(self.speculative_config):
+            set_custom_class_request_ids(
+                self.drafter,
+                self.input_batch.req_ids,
+                valid_sampled_token_ids,
+            )
+            draft_token_ids = self.drafter.propose(
+                valid_sampled_token_ids,
+                self.input_batch.num_tokens_no_spec,
+                self.input_batch.token_ids_cpu,
+            )
         elif isinstance(self.drafter, AscendNgramProposer):
             draft_token_ids = self.drafter.propose(
                 scheduler_output.num_spec_tokens_to_schedule,

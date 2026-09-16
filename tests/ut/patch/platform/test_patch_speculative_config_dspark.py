@@ -32,6 +32,25 @@ def test_legacy_qwen3_dspark_config_uses_qwen3_loader():
     assert normalized.block_size == 7
 
 
+def test_custom_class_post_init_skips_draft_model_config():
+    config = SimpleNamespace(
+        method="custom_class",
+        model="pkg.CustomProposer",
+        num_speculative_tokens=4,
+        prompt_lookup_min=None,
+        prompt_lookup_max=None,
+        draft_model_config=object(),
+        draft_parallel_config=object(),
+    )
+
+    patch_speculative_config._dspark_post_init(config)
+
+    assert config.prompt_lookup_min == 0
+    assert config.prompt_lookup_max == 0
+    assert config.draft_model_config is None
+    assert config.draft_parallel_config is None
+
+
 def test_deepseek_v4_vision_dspark_restores_draft_architecture():
     hf_config = SimpleNamespace(
         model_type="deepseek_v4",
