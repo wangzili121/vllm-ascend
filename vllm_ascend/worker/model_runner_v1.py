@@ -1708,9 +1708,7 @@ class NPUModelRunner(GPUModelRunner):
                     else None
                 ),
             )
-            if get_pp_group().world_size > 1 and hasattr(
-                self.drafter, "take_last_draft_probs"
-            ):
+            if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
@@ -2468,10 +2466,8 @@ class NPUModelRunner(GPUModelRunner):
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
-        draft_probs = (
-            self._get_spec_decode_draft_probs(spec_decode_metadata)
-            if get_pp_group().world_size > 1
-            else None
+        draft_probs = self._get_spec_decode_draft_probs(
+            spec_decode_metadata
         )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -4798,8 +4794,8 @@ class NPUModelRunner(GPUModelRunner):
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
         for layer_name, attn_module in attn_layers.items():
-            if (isinstance(attn_module, Attention)
-                    and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
+            if (kv_tgt_layer := getattr(
+                    attn_module, "kv_sharing_target_layer_name", None)) is not None:
                 # The layer doesn't need its own KV cache and will use that of
                 # the target layer. We skip creating a KVCacheSpec for it, so
                 # that KV cache management logic will act as this layer does

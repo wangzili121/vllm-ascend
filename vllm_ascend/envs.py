@@ -104,6 +104,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Verify that Orthrus draft passes do not mutate the target KV cache.
+    # This is intended for correctness tests because checksumming is expensive.
+    "VLLM_ASCEND_ORTHRUS_VERIFY_CACHE_CHECKSUM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ORTHRUS_VERIFY_CACHE_CHECKSUM", "0"))
+    ),
 }
 
 # end-env-vars-definition

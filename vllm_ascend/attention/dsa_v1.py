@@ -526,7 +526,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens,)  # type: ignore
         else:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens, 2)  # type: ignore
-        if self.speculative_config:
+        if self.speculative_config and self.speculative_config.method != "orthrus":
             spec_token_num = self.speculative_config.num_speculative_tokens
             self.spec_slot_mapping = [
                 torch.zeros(self.slot_mapping_shape, dtype=torch.int32, device=self.device)

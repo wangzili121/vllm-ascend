@@ -535,6 +535,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_topk_indices(target_language_model)
         self._maybe_share_lm_head(model)
+        bind_shared_backbone = getattr(self.model, "bind_shared_backbone", None)
+        if bind_shared_backbone is not None:
+            bind_shared_backbone(target_language_model)
+            logger.info("Bound the Orthrus draft head to the live target backbone")
         # The draft FC, embedding, and lm_head boundaries are now aligned.
         # Release the temporary full-precision rotation before graph capture.
         self._quarot_rotation = None
@@ -1020,6 +1024,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_draft_tokens_cpu: list[int] | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
+        self._last_draft_probs = None
 
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
@@ -1280,6 +1285,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
                 "num_tokens": num_tokens,
                 "is_prefill": is_prefill_batch,
+                "sampling_metadata": sampling_metadata,
             }
             runnable = cast(Callable[..., Any], self._runnable)
             run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
@@ -1317,6 +1323,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         multi_steps_attn_metadata,
         num_tokens,
         is_prefill=None,
+        sampling_metadata=None,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
@@ -1375,6 +1382,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        draft_probs = None
 
         if get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
@@ -1422,6 +1430,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         logits_bias = self.model.markov_bias(markov_emb)
                         logits[:, idx].add_(logits_bias)
                         draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+            elif self.method == "orthrus" and sampling_metadata is not None:
+                draft_token_ids, draft_probs = self._sample_draft_tokens(sample_hidden_states, sampling_metadata)
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():
@@ -1438,9 +1448,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             if self.method == "dspark":
                 return draft_token_ids[:, 1:]
-            else:
-                # [batch_size, 1]
-                return draft_token_ids.view(-1, self.num_speculative_tokens)
+            if self.method == "orthrus" and draft_probs is not None:
+                self._last_draft_probs = draft_probs.view(
+                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                ).contiguous()
+            # [batch_size, num_speculative_tokens]
+            return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         # The logits are split and then merged only when lmhead_tp_enable() is enabled.
         # As a result, the batch size length becomes the actual length 32.

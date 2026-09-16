@@ -25,6 +25,10 @@ def register_model():
         "vllm_ascend.models.deepseek_v4_dspark:DSparkDeepseekV4ForCausalLM",
     )
     ModelRegistry.register_model(
+        "OrthrusDSV4DraftModel",
+        "vllm_ascend.models.deepseek_v4_orthrus:OrthrusDSV4DraftModel",
+    )
+    ModelRegistry.register_model(
         "LlamaForCausalLMVwnEagle3", "vllm_ascend.models.llama_eagle3_vwn:Eagle3VwnLlamaForCausalLM"
     )
     ModelRegistry.register_model("Qwen3DSparkModel", "vllm_ascend.models.qwen3_dspark:AscendQwen3DSparkForCausalLM")

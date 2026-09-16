@@ -1,5 +1,7 @@
 from typing import TYPE_CHECKING, Any
 
+from pydantic.dataclasses import rebuild_dataclass
+from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.transformers_utils.configs.speculators import algos as speculator_algos
 from vllm.utils.import_utils import LazyLoader
@@ -10,6 +12,8 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import (
 )
 
 _orig_post_init = SpeculativeConfig.__post_init__
+_orig_uses_draft_model = SpeculativeConfig.uses_draft_model
+_orig_verify_equal_vocab_size = SpeculativeConfig.verify_equal_vocab_size_if_draft_model
 
 if TYPE_CHECKING:
     import vllm.model_executor.layers.quantization as me_quant
@@ -184,7 +188,61 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
     return hf_config
 
 
-def _dspark_post_init(self):
+def _init_orthrus(self) -> None:
+    if self.target_model_config is None or self.target_parallel_config is None:
+        raise ValueError("Orthrus requires target model and parallel configs")
+    if self.model is None:
+        raise ValueError("Orthrus requires a diffusion head model path")
+    if self.num_speculative_tokens != 31:
+        raise ValueError("DeepSeek-V4 Orthrus requires 31 speculative tokens")
+    if self.draft_tensor_parallel_size not in (
+        None,
+        self.target_parallel_config.tensor_parallel_size,
+    ):
+        raise ValueError("Orthrus draft TP must equal target model TP")
+
+    self.prompt_lookup_max = 0
+    self.prompt_lookup_min = 0
+    self.parallel_drafting = True
+    self.enforce_eager = True
+    self.draft_model_config = ModelConfig(
+        model=self.model,
+        runner="draft",
+        tokenizer=self.target_model_config.tokenizer,
+        tokenizer_mode=self.target_model_config.tokenizer_mode,
+        trust_remote_code=self.target_model_config.trust_remote_code,
+        allowed_local_media_path=self.target_model_config.allowed_local_media_path,
+        allowed_media_domains=self.target_model_config.allowed_media_domains,
+        dtype=self.target_model_config.dtype,
+        seed=self.target_model_config.seed,
+        revision=self.revision,
+        code_revision=self.code_revision,
+        tokenizer_revision=self.target_model_config.tokenizer_revision,
+        max_model_len=self.max_model_len,
+        spec_target_max_model_len=self.target_model_config.max_model_len,
+        quantization=self.quantization,
+        enforce_eager=True,
+        max_logprobs=self.target_model_config.max_logprobs,
+        hf_overrides={"architectures": ["OrthrusDSV4DraftModel"]},
+        config_format=self.target_model_config.config_format,
+    )
+    self.draft_tensor_parallel_size = self.target_parallel_config.tensor_parallel_size
+    self.draft_model_config.max_model_len = self._maybe_override_draft_max_model_len(
+        self.max_model_len,
+        self.draft_model_config.max_model_len,
+        self.target_model_config.max_model_len,
+    )
+    self.draft_parallel_config = self.create_draft_parallel_config(
+        self.target_parallel_config,
+        self.draft_tensor_parallel_size,
+    )
+
+
+def _speculative_post_init(self):
+    if self.method == "orthrus":
+        _init_orthrus(self)
+        return self
+
     _orig_post_init(self)
     if self.use_dspark():
         draft_model_config = self.draft_model_config
@@ -205,7 +263,38 @@ def _dspark_post_init(self):
             draft_hf_config.model_type = K3DSparkConfig.model_type
             draft_hf_config.architectures = ["K3DSparkModel"]
             self.update_arch_()
+    return self
+
+
+def _uses_draft_model(self) -> bool:
+    return self.method == "orthrus" or _orig_uses_draft_model(self)
+
+
+def _verify_equal_vocab_size_if_draft_model(self) -> None:
+    if self.method != "orthrus":
+        _orig_verify_equal_vocab_size(self)
+        return
+    if self.target_model_config is None or self.draft_model_config is None:
+        return
+    target_vocab_size = self.target_model_config.get_vocab_size()
+    draft_vocab_size = self.draft_model_config.get_vocab_size()
+    if target_vocab_size != draft_vocab_size:
+        raise ValueError(
+            "Orthrus target and diffusion head must have the same vocabulary "
+            f"size, got {target_vocab_size} and {draft_vocab_size}"
+        )
 
 
 SpeculativeConfig.hf_config_override = hf_config_override
-SpeculativeConfig.__post_init__ = _dspark_post_init
+SpeculativeConfig.__post_init__ = _speculative_post_init
+SpeculativeConfig.uses_draft_model = _uses_draft_model
+SpeculativeConfig.verify_equal_vocab_size_if_draft_model = _verify_equal_vocab_size_if_draft_model
+
+# vLLM 0.26 validates ``method`` as a Literal before __post_init__. This
+# release-only compatibility patch keeps the public method name without
+# modifying the vLLM package installed in the image. Unknown methods still
+# fail in the original post-init path.
+SpeculativeConfig.__annotations__["method"] = str | None
+SpeculativeConfig.__dataclass_fields__["method"].type = str | None
+SpeculativeConfig.__pydantic_fields__["method"].annotation = str | None
+rebuild_dataclass(SpeculativeConfig, force=True)
