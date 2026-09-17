@@ -458,7 +458,9 @@ class NPUPlatform(Platform):
         ascend_config.update_compile_ranges_split_points()
 
         if model_config and hasattr(model_config.hf_text_config, "index_topk"):
-            vllm_config.cache_config.cache_dtype = str(model_config.dtype).replace("torch.", "")
+            model_dtype = str(model_config.dtype).replace("torch.", "")
+            if vllm_config.cache_config.cache_dtype in ("auto", model_dtype):
+                vllm_config.cache_config.cache_dtype = model_dtype
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         if ascend_fusion_config:
