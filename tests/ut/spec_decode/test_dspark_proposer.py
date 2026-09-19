@@ -403,6 +403,11 @@ class TestDSparkInitialization(_DSparkProposerTestBase):
         assert proposer.num_query_per_req == expected_num_query_per_req
         assert proposer.max_query_tokens == expected_max_query_tokens
 
+    def test_dummy_forward_context_includes_input_ids(self) -> None:
+        source = inspect.getsource(AscendDSparkProposer.dummy_run)
+
+        assert "input_ids=self.input_ids[:num_query_total]" in source
+
 
 # fmt: off
 class TestSetPerGroupAttnMetadata(_DSparkProposerTestBase):

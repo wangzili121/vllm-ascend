@@ -3875,12 +3875,17 @@ class NPUModelRunner(GPUModelRunner):
         for group_kv_cache_spec in kv_cache_config.kv_cache_groups:
             group_spec = group_kv_cache_spec.kv_cache_spec
             for layer_name in group_kv_cache_spec.layer_names:
+                spec_layer_name = self.shared_kv_cache_layers.get(
+                    layer_name, layer_name
+                )
                 if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec[layer_name] = group_spec.kv_cache_specs[layer_name]
+                    layer_kv_cache_spec[layer_name] = group_spec.kv_cache_specs[
+                        spec_layer_name
+                    ]
                 else:
                     layer_kv_cache_spec[layer_name] = group_spec
                 if static_forward_context is not None:
-                    attn_layer = static_forward_context.get(layer_name)
+                    attn_layer = static_forward_context.get(spec_layer_name)
                     if isinstance(attn_layer, AttentionLayerBase):
                         spec = attn_layer.get_kv_cache_spec(self.vllm_config)
                         if isinstance(spec, AscendSFAIndexerCacheSpec):
@@ -4710,6 +4715,8 @@ class NPUModelRunner(GPUModelRunner):
             # they are cached correctly, there will be different objects per
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
+                if layer_name in self.shared_kv_cache_layers:
+                    continue
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]

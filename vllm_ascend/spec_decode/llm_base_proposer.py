@@ -916,6 +916,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            input_ids=self.input_ids[:num_tokens],
             eplb_heat_collection_status=(
                 self.runner.eplb_heat_collection_status if self.runner.dynamic_eplb else False
             ),
@@ -1267,6 +1268,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            input_ids=self.input_ids[:num_input_tokens],
             eplb_heat_collection_status=(
                 self.runner.eplb_heat_collection_status if self.runner.dynamic_eplb else False
             ),

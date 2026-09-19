@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +42,18 @@ NON_FULL_CUDAGRAPH_MODES = [
     CUDAGraphMode.NONE,
     CUDAGraphMode.PIECEWISE,
 ]
+
+
+class TestDraftForwardContextInputs:
+    def test_dummy_run_includes_input_ids(self):
+        source = inspect.getsource(AscendSpecDecodeBaseProposer.dummy_run)
+
+        assert "input_ids=self.input_ids[:num_tokens]" in source
+
+    def test_propose_includes_input_ids(self):
+        source = inspect.getsource(AscendSpecDecodeBaseProposer._propose)
+
+        assert "input_ids=self.input_ids[:num_input_tokens]" in source
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:

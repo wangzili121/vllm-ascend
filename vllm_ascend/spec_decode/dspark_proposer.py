@@ -413,6 +413,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=[],
+            input_ids=self.input_ids[:num_query_total],
         ):
             if is_profile:
                 self.model.precompute_and_store_context_kv(context_states, context_positions)

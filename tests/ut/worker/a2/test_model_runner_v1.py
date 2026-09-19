@@ -79,6 +79,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.hybrid_with_attn_and_mamba = False
         runner.sfa_dcp_replicated_indexer_size = 1
         runner.runner_only_attn_layers = set()
+        runner.shared_kv_cache_layers = {}
         runner.is_kv_consumer = False
         runner.sparse_kv_offload_enabled = False
         runner.sparse_kv_offload_config = MagicMock()
@@ -159,6 +160,46 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         layer_specs = runner._get_layer_kv_cache_specs(kv_cache_config)
 
         self.assertIs(layer_specs[layer_name], indexer_spec)
+
+    def test_get_layer_kv_cache_specs_resolves_shared_layer_alias(self):
+        runner = self._build_runner()
+        target_layer_name = "model.layers.1.self_attn.attn"
+        draft_layer_name = "draft_model.layers.1.self_attn.attn"
+        target_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            head_size_v=128,
+            dtype=torch.bfloat16,
+        )
+        group_spec = UniformTypeKVCacheSpecs.from_specs(
+            {target_layer_name: target_spec}
+        )
+        assert group_spec is not None
+        runner.shared_kv_cache_layers = {
+            draft_layer_name: target_layer_name,
+        }
+        runner.compilation_config = SimpleNamespace(static_forward_context={})
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=target_spec.page_size_bytes * 2,
+                    shared_by=[target_layer_name, draft_layer_name],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[target_layer_name, draft_layer_name],
+                    kv_cache_spec=group_spec,
+                )
+            ],
+        )
+
+        layer_specs = runner._get_layer_kv_cache_specs(kv_cache_config)
+
+        self.assertIs(layer_specs[target_layer_name], target_spec)
+        self.assertIs(layer_specs[draft_layer_name], target_spec)
 
     def test_sparse_c8_indexer_reuses_raw_cache_from_shared_descriptor(self):
         runner = self._build_runner()
