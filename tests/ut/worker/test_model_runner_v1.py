@@ -88,6 +88,7 @@ class TestCustomClassProposer(unittest.TestCase):
         runner.speculative_config = SimpleNamespace(method="custom_class")
         runner.drafter = Proposer()
         runner.input_batch = SimpleNamespace(
+            num_reqs=2,
             req_ids=["req-0", "req-1", "req-2"],
             num_tokens_no_spec=[5, 6, 7],
             token_ids_cpu=[[1, 2], [3, 4], [5, 6]],
@@ -110,12 +111,42 @@ class TestCustomClassProposer(unittest.TestCase):
             runner.drafter.call,
             (
                 [[8], []],
-                [5, 6, 7],
-                [[1, 2], [3, 4], [5, 6]],
+                [5, 6],
+                [[1, 2], [3, 4]],
             ),
         )
         self.assertIsNone(runner._draft_probs)
         self.assertIsNone(runner._draft_prob_req_ids)
+
+    def test_custom_class_propose_drops_sequence_parallel_padding(self):
+        proposer = MagicMock()
+        proposer.propose.return_value = [[10, 11]]
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._log_propose_draft_token_ids_entry = MagicMock()
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+        runner.drafter = proposer
+        runner.input_batch = SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-0"],
+            num_tokens_no_spec=[5, 0, 0, 0, 0, 0, 0, 0],
+            token_ids_cpu=[[1, 2], [], [], [], [], [], [], []],
+        )
+
+        result = runner.propose_draft_token_ids(
+            [[8], [], [], [], [], [], [], []],
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        )
+
+        self.assertEqual(result, [[10, 11]])
+        proposer.set_request_ids.assert_called_once_with(("req-0",))
+        proposer.propose.assert_called_once_with([[8]], [5], [[1, 2]])
 
 
 class TestGlm5MtpGraphMetadata(unittest.TestCase):

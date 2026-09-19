@@ -1864,15 +1864,22 @@ class NPUModelRunner(GPUModelRunner):
             # Speculative decoding is not enabled.
             draft_token_ids = None
         elif is_custom_class_method(self.speculative_config):
+            # Sequence parallelism may pad a small request batch to TP size.
+            # Custom proposers are request-shaped, so exclude synthetic rows.
+            batch_size = min(
+                self.input_batch.num_reqs,
+                len(valid_sampled_token_ids),
+            )
+            sampled_token_ids = valid_sampled_token_ids[:batch_size]
             set_custom_class_request_ids(
                 self.drafter,
-                self.input_batch.req_ids,
-                valid_sampled_token_ids,
+                self.input_batch.req_ids[:batch_size],
+                sampled_token_ids,
             )
             draft_token_ids = self.drafter.propose(
-                valid_sampled_token_ids,
-                self.input_batch.num_tokens_no_spec,
-                self.input_batch.token_ids_cpu,
+                sampled_token_ids,
+                self.input_batch.num_tokens_no_spec[:batch_size],
+                self.input_batch.token_ids_cpu[:batch_size],
             )
         elif isinstance(self.drafter, AscendNgramProposer):
             draft_token_ids = self.drafter.propose(
