@@ -40,6 +40,11 @@ from vllm_ascend.models.glm5next.kv_cache import (
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
+from vllm_ascend.spec_decode.custom_class import (
+    MODEL_AWARE_CUSTOM_PROPOSER_API_VERSION,
+    ModelAwareCustomProposerRuntime,
+    is_model_aware_custom_proposer,
+)
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -47,6 +52,74 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 
 class TestCustomClassProposer(unittest.TestCase):
+    def test_model_aware_protocol_is_explicit_and_versioned(self):
+        class Proposer:
+            npu_model_runner_api_version = MODEL_AWARE_CUSTOM_PROPOSER_API_VERSION
+
+            def bind_runtime(self, runtime):
+                self.runtime = runtime
+
+        proposer = Proposer()
+        self.assertTrue(is_model_aware_custom_proposer(proposer))
+        self.assertFalse(is_model_aware_custom_proposer(object()))
+
+        proposer.npu_model_runner_api_version = 999
+        with self.assertRaisesRegex(ValueError, "API version"):
+            is_model_aware_custom_proposer(proposer)
+
+    @patch("vllm_ascend.worker.model_runner_v1.AscendRejectionSampler")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_set_up_drafter_binds_model_aware_runtime(self, mock_get_pp_group, mock_rejection_sampler):
+        class Proposer:
+            npu_model_runner_api_version = MODEL_AWARE_CUSTOM_PROPOSER_API_VERSION
+
+            def bind_runtime(self, runtime):
+                self.runtime = runtime
+
+        mock_get_pp_group.return_value = SimpleNamespace(is_last_rank=True)
+        speculative_config = SimpleNamespace(
+            method="custom_class",
+            num_speculative_tokens=2,
+            use_dspark=MagicMock(return_value=False),
+        )
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        runner.speculative_config = speculative_config
+        runner.drafter = Proposer()
+        runner._get_drafter = MagicMock()
+        runner._make_buffer = MagicMock(return_value=MagicMock())
+        runner.max_num_reqs = 8
+        runner.sampler = MagicMock()
+        runner.device = MagicMock()
+
+        runner._set_up_drafter()
+
+        runtime = runner.drafter.runtime
+        self.assertIsInstance(runtime, ModelAwareCustomProposerRuntime)
+        self.assertIs(runtime.runner, runner)
+        self.assertIs(runtime.vllm_config, runner.vllm_config)
+        self.assertIs(runtime.device, runner.device)
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_non_attention_cache_alias_is_not_allocated(self, mock_get_layers, _mock_has_ec_transfer):
+        alias = SimpleNamespace(kv_sharing_target_layer_name="model.layers.0.self_attn.attn")
+        mock_get_layers.return_value = {"draft.layers.0.self_attn.attn": alias}
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.vllm_config = MagicMock()
+        runner.shared_kv_cache_layers = {}
+        runner.use_compress = False
+        runner.use_sparse = False
+        runner.sparse_kv_offload_enabled = False
+
+        specs = runner.get_kv_cache_spec()
+
+        self.assertEqual(specs, {})
+        self.assertEqual(
+            runner.shared_kv_cache_layers,
+            {"draft.layers.0.self_attn.attn": ("model.layers.0.self_attn.attn")},
+        )
+
     @patch("vllm_ascend.worker.model_runner_v1.AscendRejectionSampler")
     @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
     def test_set_up_drafter_reuses_upstream_custom_proposer(self, mock_get_pp_group, mock_rejection_sampler):

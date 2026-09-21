@@ -161,6 +161,11 @@ from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+from vllm_ascend.spec_decode.custom_class import (
+    MODEL_AWARE_CUSTOM_PROPOSER_API_VERSION,
+    ModelAwareCustomProposerRuntime,
+    is_model_aware_custom_proposer,
+)
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
@@ -691,6 +696,15 @@ class NPUModelRunner(GPUModelRunner):
                 if not self._uses_custom_class_proposer():
                     self.drafter = self._get_drafter()
                 assert self.drafter is not None
+                if is_model_aware_custom_proposer(self.drafter):
+                    self.drafter.bind_runtime(
+                        ModelAwareCustomProposerRuntime(
+                            api_version=MODEL_AWARE_CUSTOM_PROPOSER_API_VERSION,
+                            vllm_config=self.vllm_config,
+                            device=self.device,
+                            runner=self,
+                        )
+                    )
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
@@ -710,6 +724,11 @@ class NPUModelRunner(GPUModelRunner):
         return (
             self.speculative_config is not None
             and self.speculative_config.method == "custom_class"
+        )
+
+    def _uses_model_aware_custom_proposer(self) -> bool:
+        return self._uses_custom_class_proposer() and is_model_aware_custom_proposer(
+            self.drafter
         )
 
     def _get_drafter(self):
@@ -1843,7 +1862,10 @@ class NPUModelRunner(GPUModelRunner):
         if self.drafter is None:
             # Speculative decoding is not enabled.
             draft_token_ids = None
-        elif self._uses_custom_class_proposer():
+        elif (
+            self._uses_custom_class_proposer()
+            and not self._uses_model_aware_custom_proposer()
+        ):
             # Sequence parallelism may pad a small request batch to TP size.
             # Custom proposers are request-shaped, so exclude synthetic rows.
             assert isinstance(valid_sampled_token_ids, list)
@@ -1946,7 +1968,11 @@ class NPUModelRunner(GPUModelRunner):
                 )
             )
             self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
-        elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
+        elif (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()
+            or self._uses_model_aware_custom_proposer()
+        ):
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -2787,6 +2813,7 @@ class NPUModelRunner(GPUModelRunner):
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
                 or self.speculative_config.use_ngram_gpu()
+                or self._uses_model_aware_custom_proposer()
             ) and not self.speculative_config.disable_padded_drafter_batch
             early_pp_padded_drafter = (
                 use_pp_spec_decode
@@ -4107,7 +4134,10 @@ class NPUModelRunner(GPUModelRunner):
 
             if (
                 self.drafter is not None
-                and not self._uses_custom_class_proposer()
+                and (
+                    not self._uses_custom_class_proposer()
+                    or self._uses_model_aware_custom_proposer()
+                )
                 and not profile_cpp
             ):
                 self.drafter.dummy_run(
@@ -4220,7 +4250,10 @@ class NPUModelRunner(GPUModelRunner):
                     break
             if (
                 self.drafter is not None
-                and not self._uses_custom_class_proposer()
+                and (
+                    not self._uses_custom_class_proposer()
+                    or self._uses_model_aware_custom_proposer()
+                )
             ):
                 logger.info("Loading drafter model...")
                 with get_tp_context(self.drafter):
@@ -4413,18 +4446,22 @@ class NPUModelRunner(GPUModelRunner):
             and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
+                or self._uses_model_aware_custom_proposer()
             )
         ):
-            assert isinstance(
-                self.drafter,
-                AscendEagleProposer
-                | AscendGemma4Proposer
-                | AscendDflashProposer
-                | AscendDSparkProposer
-                | AscendDraftModelProposer,
-            )
+            if not self._uses_model_aware_custom_proposer():
+                assert isinstance(
+                    self.drafter,
+                    AscendEagleProposer
+                    | AscendGemma4Proposer
+                    | AscendDflashProposer
+                    | AscendDSparkProposer
+                    | AscendDraftModelProposer,
+                )
             kernel_block_sizes = self.kernel_block_sizes
-            if isinstance(self.drafter, AscendDSparkProposer):
+            if isinstance(self.drafter, AscendDSparkProposer) or getattr(
+                self.drafter, "uses_hybrid_cache_groups", False
+            ):
                 sizes = kernel_block_sizes if isinstance(kernel_block_sizes, list) else [kernel_block_sizes]
                 draft_kernel_block_sizes = [
                     int(size[0] if isinstance(size, (list, tuple)) else size) for size in sizes
@@ -5692,8 +5729,8 @@ class NPUModelRunner(GPUModelRunner):
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
         for layer_name, attn_module in attn_layers.items():
-            if (isinstance(attn_module, Attention)
-                    and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
+            if (kv_tgt_layer := getattr(
+                    attn_module, "kv_sharing_target_layer_name", None)) is not None:
                 # The layer doesn't need its own KV cache and will use that of
                 # the target layer. We skip creating a KVCacheSpec for it, so
                 # that KV cache management logic will act as this layer does

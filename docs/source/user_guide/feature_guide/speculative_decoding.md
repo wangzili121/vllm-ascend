@@ -26,9 +26,21 @@ The following speculative decoding methods are supported:
 | `extract_hidden_states` | Extract hidden states for EAGLE training |
 
 `custom_class` uses the proposer interface and dynamic class loading provided by
-vLLM. The proposer receives the sampled tokens, per-request token counts, token
-histories, and NPU slot mapping. It does not participate in draft-model loading
-or graph warmup.
+vLLM. By default, the proposer receives sampled tokens, per-request token
+counts, token histories, and NPU slot mappings; it does not participate in
+draft-model loading or graph warmup.
+
+A custom proposer backed by a neural draft model can opt into the Ascend model
+proposer lifecycle. It must set `npu_model_runner_api_version = 1` and implement
+`bind_runtime(runtime)`. After binding, it participates in model loading, KV
+cache initialization, padded-batch input preparation, dummy runs, and model
+proposals through the same lifecycle as built-in model proposers. This API is
+intended for external plugins: model-specific code stays outside
+vLLM-Ascend. Model-aware custom proposers currently run in eager mode and are
+responsible for implementing the delegated lifecycle methods.
+Plugin-specific options can be placed under
+`additional_config.custom_proposer_config`; the plugin must validate its own
+nested configuration.
 
 ## Common Configuration
 

@@ -213,6 +213,7 @@ def test_load_model_reads_validated_draft_window_size():
     draft_layer.get_kv_cache_spec.return_value = object()
     draft_layer.get_attn_backend.return_value.get_supported_kernel_block_sizes.return_value = [16]
 
+    target_model = MagicMock()
     with (
         patch("vllm_ascend.spec_decode.llm_base_proposer.get_pp_group") as mock_pp_group,
         patch(
@@ -226,10 +227,11 @@ def test_load_model_reads_validated_draft_window_size():
         mock_pp_group.return_value.is_last_rank = True
         mock_get_ascend_config.return_value.draft_window_size = 4096
 
-        proposer.load_model(MagicMock())
+        proposer.load_model(target_model)
 
     assert proposer.draft_window_size == 4096
     mock_adapter.assert_called_once_with(4096, 16, 8, 4, "cpu")
+    draft_model.bind_shared_backbone.assert_called_once_with(target_model)
 
 
 def test_draft_vllm_config_only_propagates_draft_runner_type():

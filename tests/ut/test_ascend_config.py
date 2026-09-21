@@ -1602,6 +1602,18 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             init_ascend_config(vc)
 
     @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_custom_proposer_config_is_preserved(self, mock_fix):
+        vc = VllmConfig()
+        options = {"orthrus": {"head_model": "/models/orthrus-head"}}
+        vc.additional_config = {"custom_proposer_config": options}
+
+        config = init_ascend_config(vc)
+
+        self.assertEqual(config.custom_proposer_config, options)
+        self.assertEqual(vc.additional_config["custom_proposer_config"], options)
+
+    @_clean_up
     @patch("vllm_ascend.ascend_config.logger.warning")
     @patch(
         "vllm_ascend.ascend_config.importlib.util.find_spec",

@@ -464,6 +464,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_topk_indices(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        bind_target_model = getattr(self.model, "bind_shared_backbone", None)
+        if bind_target_model is not None:
+            bind_target_model(target_language_model)
+            logger.info("[spec_decode/base] Bound draft model to the target backbone")
 
         if (
             self.parallel_drafting

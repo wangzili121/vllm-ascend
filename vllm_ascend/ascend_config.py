@@ -330,6 +330,7 @@ class AscendConfig:
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
+            "custom_proposer_config": {},
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -466,6 +467,9 @@ class AscendConfig:
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
+    # Opaque namespace for external custom proposers. The proposer owns the
+    # nested schema and validation; AscendConfig only admits the top-level key.
+    custom_proposer_config: dict[str, Any] = dataclasses.field(default_factory=dict)
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
