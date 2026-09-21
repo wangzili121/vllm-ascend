@@ -28,7 +28,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -175,10 +175,6 @@ from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
-from vllm_ascend.spec_decode.custom_class_proposer import (
-    is_custom_class_method,
-    set_custom_class_request_ids,
-)
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
@@ -320,30 +316,6 @@ def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
 
 
-@contextmanager
-def custom_class_base_runner_compat(vllm_config: VllmConfig):
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if not is_custom_class_method(speculative_config):
-        yield
-        return
-
-    saved = {
-        "method": speculative_config.method,
-        "model": speculative_config.model,
-        "prompt_lookup_min": getattr(speculative_config, "prompt_lookup_min", None),
-        "prompt_lookup_max": getattr(speculative_config, "prompt_lookup_max", None),
-    }
-    speculative_config.method = "ngram"
-    speculative_config.model = "ngram"
-    speculative_config.prompt_lookup_min = 1
-    speculative_config.prompt_lookup_max = 1
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            setattr(speculative_config, name, value)
-
-
 def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     """Count NaNs without the unsupported NPU ``sum(dtype=...)`` overload."""
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
@@ -382,7 +354,7 @@ class NPUModelRunner(GPUModelRunner):
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
 
-        with _torch_cuda_wrapper(), custom_class_base_runner_compat(vllm_config):
+        with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -711,20 +683,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
-        self.drafter: (
-            AscendNgramProposer
-            | AscendNgramProposerNPU
-            | AscendEagleProposer
-            | AscendStep3p5MTPProposer
-            | AscendDraftModelProposer
-            | AscendDflashProposer
-            | AscendDSparkProposer
-            | AscendGemma4Proposer
-            | AscendSuffixDecodingProposer
-            | AscendMedusaProposer
-            | AscendExtractHiddenStatesProposer
-            | None
-        ) = None
+        inherited_custom_drafter = (
+            getattr(self, "drafter", None)
+            if self._uses_custom_class_proposer()
+            else None
+        )
+        self.drafter = inherited_custom_drafter
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -732,7 +696,9 @@ class NPUModelRunner(GPUModelRunner):
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
-                self.drafter = self._get_drafter()
+                if not self._uses_custom_class_proposer():
+                    self.drafter = self._get_drafter()
+                assert self.drafter is not None
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
@@ -747,6 +713,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
+
+    def _uses_custom_class_proposer(self) -> bool:
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.method == "custom_class"
+        )
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1860,26 +1832,24 @@ class NPUModelRunner(GPUModelRunner):
         self._draft_probs = None
         self._draft_prob_req_ids = None
 
-        if not self.drafter:
+        if self.drafter is None:
             # Speculative decoding is not enabled.
             draft_token_ids = None
-        elif is_custom_class_method(self.speculative_config):
+        elif self._uses_custom_class_proposer():
             # Sequence parallelism may pad a small request batch to TP size.
             # Custom proposers are request-shaped, so exclude synthetic rows.
+            assert isinstance(valid_sampled_token_ids, list)
+            assert spec_decode_common_attn_metadata is not None
             batch_size = min(
                 self.input_batch.num_reqs,
                 len(valid_sampled_token_ids),
             )
             sampled_token_ids = valid_sampled_token_ids[:batch_size]
-            set_custom_class_request_ids(
-                self.drafter,
-                self.input_batch.req_ids[:batch_size],
-                sampled_token_ids,
-            )
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids = cast(Any, self.drafter).propose(
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec[:batch_size],
                 self.input_batch.token_ids_cpu[:batch_size],
+                slot_mappings=spec_decode_common_attn_metadata.slot_mapping,
             )
         elif isinstance(self.drafter, AscendNgramProposer):
             draft_token_ids = self.drafter.propose(
@@ -4030,7 +4000,11 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter and not profile_cpp:
+            if (
+                self.drafter is not None
+                and not self._uses_custom_class_proposer()
+                and not profile_cpp
+            ):
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -4134,7 +4108,10 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
-            if self.drafter:
+            if (
+                self.drafter is not None
+                and not self._uses_custom_class_proposer()
+            ):
                 logger.info("Loading drafter model...")
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
@@ -4215,7 +4192,10 @@ class NPUModelRunner(GPUModelRunner):
         if cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
-            if self.drafter is not None:
+            if (
+                self.drafter is not None
+                and not self._uses_custom_class_proposer()
+            ):
                 if hasattr(self.drafter, "set_update_stream"):
                     self.drafter.set_update_stream(self.update_stream)
                 else:
@@ -4233,7 +4213,11 @@ class NPUModelRunner(GPUModelRunner):
                     enable_enpu=self.enable_enpu,
                 )
                 drafter = getattr(self, "drafter", None)
-                if drafter is not None and hasattr(drafter, "model"):
+                if (
+                    drafter is not None
+                    and not self._uses_custom_class_proposer()
+                    and hasattr(drafter, "model")
+                ):
                     drafter.model = BreakableACLGraphWrapper(
                         drafter.model,
                         self.vllm_config,

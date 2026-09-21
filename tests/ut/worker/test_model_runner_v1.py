@@ -41,45 +41,54 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
 from vllm_ascend.utils import AscendDeviceType, vllm_version_is
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, custom_class_base_runner_compat
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 
 class TestCustomClassProposer(unittest.TestCase):
-    def test_base_runner_compat_restores_custom_class_config(self):
+    @patch("vllm_ascend.worker.model_runner_v1.AscendRejectionSampler")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_set_up_drafter_reuses_upstream_custom_proposer(self, mock_get_pp_group, mock_rejection_sampler):
+        mock_get_pp_group.return_value = SimpleNamespace(is_last_rank=True)
         speculative_config = SimpleNamespace(
             method="custom_class",
-            model="pkg.CustomProposer",
-            prompt_lookup_min=0,
-            prompt_lookup_max=0,
+            num_speculative_tokens=2,
+            use_dspark=MagicMock(return_value=False),
         )
-        vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        upstream_proposer = object()
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = speculative_config
+        runner.drafter = upstream_proposer
+        runner._get_drafter = MagicMock()
+        runner._make_buffer = MagicMock(return_value=MagicMock())
+        runner.max_num_reqs = 8
+        runner.sampler = MagicMock()
+        runner.device = MagicMock()
 
-        with custom_class_base_runner_compat(vllm_config):
-            self.assertEqual(speculative_config.method, "ngram")
-            self.assertEqual(speculative_config.model, "ngram")
-            self.assertEqual(speculative_config.prompt_lookup_min, 1)
-            self.assertEqual(speculative_config.prompt_lookup_max, 1)
+        runner._set_up_drafter()
 
-        self.assertEqual(speculative_config.method, "custom_class")
-        self.assertEqual(speculative_config.model, "pkg.CustomProposer")
-        self.assertEqual(speculative_config.prompt_lookup_min, 0)
-        self.assertEqual(speculative_config.prompt_lookup_max, 0)
+        self.assertIs(runner.drafter, upstream_proposer)
+        runner._get_drafter.assert_not_called()
+        mock_rejection_sampler.assert_called_once_with(runner.sampler, speculative_config, runner.device)
 
-    def test_custom_class_propose_forwards_request_ids_and_token_history(self):
+    def test_custom_class_propose_forwards_upstream_inputs(self):
         class Proposer:
             def __init__(self):
-                self.request_ids = None
                 self.call = None
 
-            def set_request_ids(self, request_ids):
-                self.request_ids = request_ids
-
-            def propose(self, sampled_token_ids, num_tokens_no_spec, token_ids_cpu):
+            def propose(
+                self,
+                sampled_token_ids,
+                num_tokens_no_spec,
+                token_ids_cpu,
+                *,
+                slot_mappings,
+            ):
                 self.call = (
                     sampled_token_ids,
                     num_tokens_no_spec,
                     token_ids_cpu,
+                    slot_mappings,
                 )
                 return [[10, 11], []]
 
@@ -89,30 +98,30 @@ class TestCustomClassProposer(unittest.TestCase):
         runner.drafter = Proposer()
         runner.input_batch = SimpleNamespace(
             num_reqs=2,
-            req_ids=["req-0", "req-1", "req-2"],
             num_tokens_no_spec=[5, 6, 7],
             token_ids_cpu=[[1, 2], [3, 4], [5, 6]],
         )
+        common_attn_metadata = SimpleNamespace(slot_mapping="slot-mapping")
 
         draft_token_ids = runner.propose_draft_token_ids(
             [[8], []],
             None,
             None,
             None,
-            None,
+            common_attn_metadata,
             None,
             0,
             None,
         )
 
         self.assertEqual(draft_token_ids, [[10, 11], []])
-        self.assertEqual(runner.drafter.request_ids, ("req-0", "req-1"))
         self.assertEqual(
             runner.drafter.call,
             (
                 [[8], []],
                 [5, 6],
                 [[1, 2], [3, 4]],
+                "slot-mapping",
             ),
         )
         self.assertIsNone(runner._draft_probs)
@@ -128,25 +137,33 @@ class TestCustomClassProposer(unittest.TestCase):
         runner.drafter = proposer
         runner.input_batch = SimpleNamespace(
             num_reqs=1,
-            req_ids=["req-0"],
             num_tokens_no_spec=[5, 0, 0, 0, 0, 0, 0, 0],
             token_ids_cpu=[[1, 2], [], [], [], [], [], [], []],
         )
+        common_attn_metadata = SimpleNamespace(slot_mapping="slot-mapping")
 
         result = runner.propose_draft_token_ids(
             [[8], [], [], [], [], [], [], []],
             None,
             None,
             None,
-            None,
+            common_attn_metadata,
             None,
             0,
             None,
         )
 
         self.assertEqual(result, [[10, 11]])
-        proposer.set_request_ids.assert_called_once_with(("req-0",))
-        proposer.propose.assert_called_once_with([[8]], [5], [[1, 2]])
+        proposer.propose.assert_called_once_with([[8]], [5], [[1, 2]], slot_mappings="slot-mapping")
+
+    def test_identifies_custom_class_proposer(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+
+        self.assertTrue(runner._uses_custom_class_proposer())
+
+        runner.speculative_config = SimpleNamespace(method="ngram")
+        self.assertFalse(runner._uses_custom_class_proposer())
 
 
 class TestGlm5MtpGraphMetadata(unittest.TestCase):

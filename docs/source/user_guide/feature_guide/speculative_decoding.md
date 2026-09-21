@@ -25,6 +25,11 @@ The following speculative decoding methods are supported:
 | `custom_class` | External Python proposer class loaded from `speculative_config.model` |
 | `extract_hidden_states` | Extract hidden states for EAGLE training |
 
+`custom_class` uses the proposer interface and dynamic class loading provided by
+vLLM. The proposer receives the sampled tokens, per-request token counts, token
+histories, and NPU slot mapping. It does not participate in draft-model loading
+or graph warmup.
+
 ## Common Configuration
 
 All speculative decoding methods are configured through the `speculative_config` parameter when initializing the model or starting the server:
