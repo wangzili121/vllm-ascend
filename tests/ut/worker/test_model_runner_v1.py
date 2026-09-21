@@ -45,6 +45,127 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 
+class TestCustomClassProposer(unittest.TestCase):
+    @patch("vllm_ascend.worker.model_runner_v1.AscendRejectionSampler")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_set_up_drafter_reuses_upstream_custom_proposer(self, mock_get_pp_group, mock_rejection_sampler):
+        mock_get_pp_group.return_value = SimpleNamespace(is_last_rank=True)
+        speculative_config = SimpleNamespace(
+            method="custom_class",
+            num_speculative_tokens=2,
+            use_dspark=MagicMock(return_value=False),
+        )
+        upstream_proposer = object()
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = speculative_config
+        runner.drafter = upstream_proposer
+        runner._get_drafter = MagicMock()
+        runner._make_buffer = MagicMock(return_value=MagicMock())
+        runner.max_num_reqs = 8
+        runner.sampler = MagicMock()
+        runner.device = MagicMock()
+
+        runner._set_up_drafter()
+
+        self.assertIs(runner.drafter, upstream_proposer)
+        runner._get_drafter.assert_not_called()
+        mock_rejection_sampler.assert_called_once_with(runner.sampler, speculative_config, runner.device)
+
+    def test_custom_class_propose_forwards_upstream_inputs(self):
+        class Proposer:
+            def __init__(self):
+                self.call = None
+
+            def propose(
+                self,
+                sampled_token_ids,
+                num_tokens_no_spec,
+                token_ids_cpu,
+                *,
+                slot_mappings,
+            ):
+                self.call = (
+                    sampled_token_ids,
+                    num_tokens_no_spec,
+                    token_ids_cpu,
+                    slot_mappings,
+                )
+                return [[10, 11], []]
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._log_propose_draft_token_ids_entry = MagicMock()
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+        runner.drafter = Proposer()
+        runner.input_batch = SimpleNamespace(
+            num_reqs=2,
+            num_tokens_no_spec=[5, 6, 7],
+            token_ids_cpu=[[1, 2], [3, 4], [5, 6]],
+        )
+        common_attn_metadata = SimpleNamespace(slot_mapping="slot-mapping")
+
+        draft_token_ids = runner.propose_draft_token_ids(
+            [[8], []],
+            None,
+            None,
+            None,
+            common_attn_metadata,
+            None,
+            0,
+            None,
+        )
+
+        self.assertEqual(draft_token_ids, [[10, 11], []])
+        self.assertEqual(
+            runner.drafter.call,
+            (
+                [[8], []],
+                [5, 6],
+                [[1, 2], [3, 4]],
+                "slot-mapping",
+            ),
+        )
+        self.assertIsNone(runner._draft_probs)
+        self.assertIsNone(runner._draft_prob_req_ids)
+
+    def test_custom_class_propose_drops_sequence_parallel_padding(self):
+        proposer = MagicMock()
+        proposer.propose.return_value = [[10, 11]]
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._log_propose_draft_token_ids_entry = MagicMock()
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+        runner.drafter = proposer
+        runner.input_batch = SimpleNamespace(
+            num_reqs=1,
+            num_tokens_no_spec=[5, 0, 0, 0, 0, 0, 0, 0],
+            token_ids_cpu=[[1, 2], [], [], [], [], [], [], []],
+        )
+        common_attn_metadata = SimpleNamespace(slot_mapping="slot-mapping")
+
+        result = runner.propose_draft_token_ids(
+            [[8], [], [], [], [], [], [], []],
+            None,
+            None,
+            None,
+            common_attn_metadata,
+            None,
+            0,
+            None,
+        )
+
+        self.assertEqual(result, [[10, 11]])
+        proposer.propose.assert_called_once_with([[8]], [5], [[1, 2]], slot_mappings="slot-mapping")
+
+    def test_identifies_custom_class_proposer(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+
+        self.assertTrue(runner._uses_custom_class_proposer())
+
+        runner.speculative_config = SimpleNamespace(method="ngram")
+        self.assertFalse(runner._uses_custom_class_proposer())
+
+
 class TestGlm5MtpGraphMetadata(unittest.TestCase):
     @staticmethod
     def _build_dispatch_runner(speculative: bool) -> NPUModelRunner:
