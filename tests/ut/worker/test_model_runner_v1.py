@@ -69,6 +69,153 @@ class SparseAttentionBackend(AscendAttentionBackend):
         return True
 
 
+class TestNPUCustomClassProposer(unittest.TestCase):
+    @patch("vllm_ascend.worker.model_runner_v1.AscendRejectionSampler")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_setup_reuses_custom_proposer_created_by_upstream(
+        self,
+        mock_get_pp_group,
+        mock_rejection_sampler,
+    ):
+        mock_get_pp_group.return_value.is_last_rank = True
+        speculative_config = SimpleNamespace(
+            method="custom_class",
+            num_speculative_tokens=2,
+            use_dspark=MagicMock(return_value=False),
+        )
+        proposer = object()
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = speculative_config
+        runner.drafter = proposer
+        runner._get_drafter = MagicMock()
+        runner._make_buffer = MagicMock(return_value=MagicMock())
+        runner.max_num_reqs = 8
+        runner.sampler = MagicMock()
+        runner.device = MagicMock()
+
+        runner._set_up_drafter()
+
+        self.assertIs(runner.drafter, proposer)
+        runner._get_drafter.assert_not_called()
+        mock_rejection_sampler.assert_called_once_with(
+            runner.sampler, speculative_config, runner.device
+        )
+
+    @staticmethod
+    def _runner(*, device_proposer: bool) -> NPUModelRunner:
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._log_propose_draft_token_ids_entry = MagicMock()
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+        runner.uses_device_custom_proposer = device_proposer
+        runner.input_batch = SimpleNamespace(
+            num_reqs=1,
+            req_ids=["request-0", "sequence-parallel-padding"],
+            num_tokens_no_spec=np.array([2, 0], dtype=np.int32),
+            token_ids_cpu=np.array([[10, 11, 0], [0, 0, 0]], dtype=np.int32),
+        )
+        return runner
+
+    def test_sync_custom_proposer_excludes_padding_rows(self):
+        runner = self._runner(device_proposer=False)
+        runner.drafter = MagicMock()
+        runner.drafter.propose.return_value = [[12, 13]]
+
+        result = runner.propose_draft_token_ids(
+            [[12], []],
+            MagicMock(),
+            SimpleNamespace(num_spec_tokens_to_schedule=2),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            1,
+            MagicMock(),
+        )
+
+        self.assertEqual(result, [[12, 13]])
+        args = runner.drafter.propose.call_args.args
+        self.assertEqual(args[0], [[12]])
+        self.assertEqual(args[1].tolist(), [2])
+        self.assertEqual(args[2].tolist(), [[10, 11, 0]])
+
+    def test_device_custom_proposer_uses_upstream_device_path(self):
+        runner = self._runner(device_proposer=True)
+        runner.drafter = MagicMock()
+        runner._propose_device_custom = MagicMock(
+            return_value=torch.tensor([[30, 31]], dtype=torch.int32)
+        )
+        sampled = torch.tensor([[12], [-1]], dtype=torch.int32)
+
+        result = runner.propose_draft_token_ids(
+            sampled,
+            MagicMock(),
+            SimpleNamespace(num_spec_tokens_to_schedule=2),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            1,
+            MagicMock(),
+        )
+
+        self.assertEqual(result.tolist(), [[30, 31]])
+        runner._propose_device_custom.assert_called_once_with(sampled, 2)
+
+    @patch("vllm_ascend.worker.model_runner_v1.append_sampled_tokens")
+    def test_device_history_uses_fused_npu_kernel(self, mock_append):
+        runner = self._runner(device_proposer=True)
+        runner.token_ids_gpu_tensor = torch.zeros((2, 8), dtype=torch.int32)
+        runner.num_tokens_no_spec_gpu = torch.tensor([2, 0], dtype=torch.int32)
+        runner.discard_request_mask = SimpleNamespace(
+            gpu=torch.tensor([False, False])
+        )
+        runner.model_config = SimpleNamespace(
+            get_vocab_size=MagicMock(return_value=100)
+        )
+        runner.max_model_len = 6
+        expected = (
+            torch.tensor([12], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+        )
+        mock_append.return_value = expected
+        sampled = torch.tensor([[12], [-1]], dtype=torch.int32)
+
+        result = runner._update_device_custom_history(sampled)
+
+        self.assertIs(result, expected)
+        mock_append.assert_called_once_with(
+            runner.token_ids_gpu_tensor[:1],
+            runner.num_tokens_no_spec_gpu[:1],
+            sampled,
+            runner.discard_request_mask.gpu[:1],
+            vocab_size=100,
+            max_sequence_length=6,
+        )
+
+    def test_skip_drafting_preserves_async_custom_bookkeeping(self):
+        runner = self._runner(device_proposer=True)
+        runner.drafter = MagicMock()
+        runner.valid_sampled_token_count_event = object()
+        runner._update_device_custom_history = MagicMock(
+            return_value=(
+                torch.tensor([12], dtype=torch.int32),
+                torch.tensor([1], dtype=torch.int32),
+                torch.tensor([3], dtype=torch.int32),
+            )
+        )
+        runner._copy_valid_sampled_token_count = MagicMock()
+        runner._copy_draft_token_ids_to_cpu = MagicMock()
+        runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+        runner.device = torch.device("cpu")
+        runner.num_spec_tokens = 2
+        sampled = torch.tensor([[12]], dtype=torch.int32)
+
+        runner._skip_drafting(MagicMock(), sampled)
+
+        runner._update_device_custom_history.assert_called_once_with(sampled)
+        runner._copy_valid_sampled_token_count.assert_called_once()
+        runner._copy_draft_token_ids_to_cpu.assert_called_once()
+
+
 class TestGlm5MtpGraphMetadata(unittest.TestCase):
     @staticmethod
     def _build_dispatch_runner(speculative: bool) -> NPUModelRunner:

@@ -184,6 +184,7 @@ from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
+from vllm_ascend.ops.triton.spec_decode.token_history import append_sampled_tokens
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
@@ -729,6 +730,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
+        upstream_custom_drafter = (
+            getattr(self, "drafter", None)
+            if self.speculative_config
+            and self.speculative_config.method == "custom_class"
+            else None
+        )
         self.drafter: (
             AscendNgramProposer
             | AscendNgramProposerNPU
@@ -750,7 +757,10 @@ class NPUModelRunner(GPUModelRunner):
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
-                self.drafter = self._get_drafter()
+                if self.speculative_config.method == "custom_class":
+                    self.drafter = upstream_custom_drafter
+                else:
+                    self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
@@ -781,6 +791,12 @@ class NPUModelRunner(GPUModelRunner):
         # is also cleared there: otherwise a capture batch would hand the
         # builder a buffer still holding the last real step's values.
         self._replay_active = False
+
+    def _uses_custom_class_proposer(self) -> bool:
+        return bool(
+            self.speculative_config
+            and self.speculative_config.method == "custom_class"
+        )
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1987,6 +2003,20 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
+    def _update_device_custom_history(
+        self,
+        sampled_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = self.input_batch.num_reqs
+        return append_sampled_tokens(
+            self.token_ids_gpu_tensor[:batch_size],
+            self.num_tokens_no_spec_gpu[:batch_size],
+            sampled_token_ids,
+            self.discard_request_mask.gpu[:batch_size],
+            vocab_size=self.model_config.get_vocab_size(),
+            max_sequence_length=self.max_model_len,
+        )
+
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -2011,6 +2041,21 @@ class NPUModelRunner(GPUModelRunner):
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
+        elif self._uses_custom_class_proposer():
+            if self.uses_device_custom_proposer:
+                assert isinstance(valid_sampled_token_ids, torch.Tensor)
+                draft_token_ids = self._propose_device_custom(
+                    valid_sampled_token_ids,
+                    scheduler_output.num_spec_tokens_to_schedule,
+                )
+            else:
+                assert isinstance(valid_sampled_token_ids, list)
+                batch_size = self.input_batch.num_reqs
+                draft_token_ids = self.drafter.propose(
+                    valid_sampled_token_ids[:batch_size],
+                    self.input_batch.num_tokens_no_spec[:batch_size],
+                    self.input_batch.token_ids_cpu[:batch_size],
+                )
         elif isinstance(self.drafter, AscendNgramProposer):
             draft_token_ids = self.drafter.propose(
                 scheduler_output.num_spec_tokens_to_schedule,
@@ -2332,13 +2377,8 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        # If ngram_gpu is used, we need to copy the scheduler_output to avoid
-        # the modification has influence on the scheduler_output in engine core process.
-        # The replace is much faster than deepcopy.
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
-        ):
+        # Device proposers trim optimistic draft slots in the local copy.
+        if self.uses_device_token_history:
             num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
             spec_decode_tokens_copy = (
                 scheduler_output.scheduled_spec_decode_tokens.copy()
@@ -2810,6 +2850,17 @@ class NPUModelRunner(GPUModelRunner):
         if (
             sampled_token_ids is not None
             and self.valid_sampled_token_count_event is not None
+            and self.uses_device_custom_proposer
+        ):
+            next_token_ids, valid_sampled_tokens_count, _ = (
+                self._update_device_custom_history(sampled_token_ids)
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+        elif (
+            sampled_token_ids is not None
+            and self.valid_sampled_token_count_event is not None
             and self.drafter is not None
             and self._drafter_runs_model_forward()
         ):
@@ -2949,6 +3000,7 @@ class NPUModelRunner(GPUModelRunner):
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
                 or self.speculative_config.use_ngram_gpu()
+                or self.uses_device_custom_proposer
             ) and not self.speculative_config.disable_padded_drafter_batch
             early_pp_padded_drafter = (
                 use_pp_spec_decode
@@ -4382,7 +4434,11 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter and not profile_cpp:
+            if (
+                self.drafter
+                and not self._uses_custom_class_proposer()
+                and not profile_cpp
+            ):
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -4518,7 +4574,7 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
-            if self.drafter:
+            if self.drafter and not self._uses_custom_class_proposer():
                 logger.info("Loading drafter model...")
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
@@ -4626,7 +4682,7 @@ class NPUModelRunner(GPUModelRunner):
         if cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
-            if self.drafter is not None:
+            if self.drafter is not None and not self._uses_custom_class_proposer():
                 if hasattr(self.drafter, "set_update_stream"):
                     self.drafter.set_update_stream(self.update_stream)
                 else:
