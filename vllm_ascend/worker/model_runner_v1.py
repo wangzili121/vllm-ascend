@@ -149,6 +149,7 @@ from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
+from vllm_ascend.ops.triton.spec_decode.token_history import append_sampled_tokens
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
@@ -613,6 +614,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
+        upstream_custom_drafter = (
+            getattr(self, "drafter", None)
+            if self.speculative_config
+            and self.speculative_config.method == "custom_class"
+            else None
+        )
         self.drafter: (
             AscendNgramProposer
             | AscendNgramProposerNPU
@@ -633,7 +640,10 @@ class NPUModelRunner(GPUModelRunner):
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
-                self.drafter = self._get_drafter()
+                if self.speculative_config.method == "custom_class":
+                    self.drafter = upstream_custom_drafter
+                else:
+                    self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
@@ -648,6 +658,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
+
+    def _uses_custom_class_proposer(self) -> bool:
+        return bool(
+            self.speculative_config
+            and self.speculative_config.method == "custom_class"
+        )
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1502,6 +1518,20 @@ class NPUModelRunner(GPUModelRunner):
             counts_cpu[:n].copy_(num_rejected_tokens_gpu[:n], non_blocking=True)
             event.record()
 
+    def _update_device_custom_history(
+        self,
+        sampled_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = self.input_batch.num_reqs
+        return append_sampled_tokens(
+            self.token_ids_gpu_tensor[:batch_size],
+            self.num_tokens_no_spec_gpu[:batch_size],
+            sampled_token_ids,
+            self.discard_request_mask.gpu[:batch_size],
+            vocab_size=self.model_config.get_vocab_size(),
+            max_sequence_length=self.max_model_len,
+        )
+
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -1521,6 +1551,21 @@ class NPUModelRunner(GPUModelRunner):
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
+        elif self._uses_custom_class_proposer():
+            if self.uses_device_custom_proposer:
+                assert isinstance(valid_sampled_token_ids, torch.Tensor)
+                draft_token_ids = self._propose_device_custom(
+                    valid_sampled_token_ids,
+                    scheduler_output.num_spec_tokens_to_schedule,
+                )
+            else:
+                assert isinstance(valid_sampled_token_ids, list)
+                batch_size = self.input_batch.num_reqs
+                draft_token_ids = self.drafter.propose(
+                    valid_sampled_token_ids[:batch_size],
+                    self.input_batch.num_tokens_no_spec[:batch_size],
+                    self.input_batch.token_ids_cpu[:batch_size],
+                )
         elif isinstance(self.drafter, AscendNgramProposer):
             draft_token_ids = self.drafter.propose(
                 scheduler_output.num_spec_tokens_to_schedule,
@@ -1811,13 +1856,8 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
        
-        # If ngram_gpu is used, we need to copy the scheduler_output to avoid
-        # the modification has influence on the scheduler_output in engine core process.
-        # The replace is much faster than deepcopy.
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.use_ngram_gpu()
-        ):
+        # Device proposers trim optimistic draft slots in the local copy.
+        if self.uses_device_token_history:
             num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
             spec_decode_tokens_copy = (
                 scheduler_output.scheduled_spec_decode_tokens.copy()
@@ -2301,6 +2341,7 @@ class NPUModelRunner(GPUModelRunner):
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
                 or self.speculative_config.use_ngram_gpu()
+                or self.uses_device_custom_proposer
             ) and not self.speculative_config.disable_padded_drafter_batch
             early_pp_padded_drafter = (
                 use_pp_spec_decode
@@ -3509,7 +3550,11 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter and not profile_cpp:
+            if (
+                self.drafter
+                and not self._uses_custom_class_proposer()
+                and not profile_cpp
+            ):
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -3613,7 +3658,7 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
-            if self.drafter:
+            if self.drafter and not self._uses_custom_class_proposer():
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
