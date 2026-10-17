@@ -21,6 +21,79 @@ from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestCustomClassProposer(unittest.TestCase):
+    def test_empty_custom_draft_uses_one_token_decode_graph(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.uniform_decode_query_len = 8
+        runner.uses_device_custom_proposer = True
+
+        self.assertEqual(runner._graph_uniform_decode_query_len(), 1)
+
+        runner.uses_device_custom_proposer = False
+        self.assertEqual(runner._graph_uniform_decode_query_len(), 8)
+
+    def test_device_custom_proposer_uses_upstream_async_path(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+        runner.drafter = MagicMock()
+        runner.uses_device_custom_proposer = True
+        runner._propose_device_custom = MagicMock(return_value="drafts")
+        runner._log_propose_draft_token_ids_entry = MagicMock()
+        scheduler_output = SimpleNamespace(num_spec_tokens_to_schedule=7)
+        sampled_token_ids = torch.tensor([[1]], dtype=torch.int32)
+
+        result = runner.propose_draft_token_ids(
+            sampled_token_ids,
+            sampling_metadata=None,
+            scheduler_output=scheduler_output,
+            spec_decode_metadata=None,
+            spec_decode_common_attn_metadata=None,
+            positions=torch.empty(0),
+            num_scheduled_tokens=1,
+            hidden_states=torch.empty(0),
+        )
+
+        self.assertEqual(result, "drafts")
+        runner._propose_device_custom.assert_called_once_with(
+            sampled_token_ids, 7
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.append_sampled_tokens")
+    def test_device_history_uses_ascend_kernel(self, append_tokens):
+        expected = (
+            torch.tensor([1]),
+            torch.tensor([1]),
+            torch.tensor([5]),
+        )
+        append_tokens.return_value = expected
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.input_batch = SimpleNamespace(num_reqs=1)
+        runner.token_ids_gpu_tensor = torch.zeros((2, 8), dtype=torch.int32)
+        runner.num_tokens_no_spec_gpu = torch.tensor([4, 0], dtype=torch.int32)
+        runner.discard_request_mask = SimpleNamespace(
+            gpu=torch.tensor([False, False])
+        )
+        runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32000)
+        runner.max_model_len = 8
+        sampled_token_ids = torch.tensor([[12]], dtype=torch.int32)
+
+        result = runner._update_device_custom_history(sampled_token_ids)
+
+        self.assertIs(result, expected)
+        append_tokens.assert_called_once()
+        args, kwargs = append_tokens.call_args
+        self.assertTrue(torch.equal(args[0], runner.token_ids_gpu_tensor[:1]))
+        self.assertTrue(torch.equal(args[1], runner.num_tokens_no_spec_gpu[:1]))
+        self.assertIs(args[2], sampled_token_ids)
+        self.assertTrue(
+            torch.equal(args[3], runner.discard_request_mask.gpu[:1])
+        )
+        self.assertEqual(
+            kwargs,
+            {"vocab_size": 32000, "max_sequence_length": 8},
+        )
+
+
 class TestDSparkAuxCaptureMode(unittest.TestCase):
     def _build_runner(
         self,
