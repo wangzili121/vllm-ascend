@@ -178,6 +178,7 @@ def test_async_placeholder_update_skips_stale_delivery(monkeypatch, is_stale, ex
     request = _request(placeholders=4)
     scheduler = async_backport.AsyncScheduler.__new__(async_backport.AsyncScheduler)
     scheduler.kv_cache_manager = SimpleNamespace(cache_blocks=lambda *_args: None)
+    scheduler._speculation_pending_request_ids = set()
 
     def update_original(_scheduler, _request, new_token_ids, is_stale=False):
         return new_token_ids, False
@@ -196,6 +197,34 @@ def test_async_placeholder_update_skips_stale_delivery(monkeypatch, is_stale, ex
     assert new_token_ids == [10, 11]
     assert stopped is False
     assert request.num_output_placeholders == expected_placeholders
+
+
+def test_async_placeholder_drain_activates_external_speculation(monkeypatch):
+    request = _request(placeholders=2)
+    scheduler = async_backport.AsyncScheduler.__new__(async_backport.AsyncScheduler)
+    scheduler.kv_cache_manager = SimpleNamespace(cache_blocks=lambda *_args: None)
+    scheduler._speculation_pending_request_ids = {request.request_id}
+    activated = []
+    scheduler._activate_request_speculation = activated.append
+
+    def update_original(_scheduler, _request, new_token_ids, is_stale=False):
+        return new_token_ids, False
+
+    monkeypatch.setattr(
+        backport.KVDeliveryScheduler,
+        "_update_request_with_output",
+        update_original,
+    )
+
+    async_backport._update_request_with_output(
+        scheduler,
+        request,
+        [10, 11],
+        is_stale=False,
+    )
+
+    assert request.num_output_placeholders == 0
+    assert activated == [request]
 
 
 def test_50297_pressure_preemption_uses_connector_delivery_requirement():
@@ -251,7 +280,7 @@ def test_48245_output_update_keeps_stale_checks_in_original_flow():
 
 
 def _kv_schedule_body_ast(source: str) -> str:
-    """Strip only the two PR scheduler deltas from a schedule body."""
+    """Strip the PR deltas and the external-speculation fence hook."""
     tree = ast.parse(textwrap.dedent(source))
     func = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "schedule")
 
@@ -263,7 +292,10 @@ def _kv_schedule_body_ast(source: str) -> str:
             return node
 
         def visit_If(self, node: ast.If):  # noqa: N802
-            if "num_stale_output_tokens" in ast.dump(node.test) and "drop_stale_output" in ast.dump(node.test):
+            test = ast.dump(node.test)
+            if "_request_waiting_for_speculation" in test:
+                return None
+            if "num_stale_output_tokens" in test and "drop_stale_output" in test:
                 return None
             return self.generic_visit(node)
 

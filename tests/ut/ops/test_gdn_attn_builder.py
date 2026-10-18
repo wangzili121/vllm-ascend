@@ -328,6 +328,28 @@ def _assert_non_spec_conv1d_args_match_metadata(attn_metadata) -> None:
     assert torch.equal(conv1d_meta.initial_state_mode, attn_metadata.has_initial_state)
 
 
+def test_zero_draft_cudagraph_shape_uses_non_spec_decode_path():
+    device = torch.device("cpu")
+    batch_spec = BatchSpec(seq_lens=[8], query_lens=[1])
+    common = create_common_attn_metadata(batch_spec, 16, device)
+    drafts = torch.tensor([0], dtype=torch.int32)
+    accepted = torch.ones(1, dtype=torch.int32)
+
+    builder = _make_builder(
+        device=device,
+        num_heads=32,
+        num_speculative_tokens=3,
+    )
+    metadata = builder.build(
+        0,
+        common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=drafts,
+    )
+    assert metadata.num_spec_decodes == 0
+    assert metadata.num_decodes == 1
+
+
 @pytest.mark.parametrize(
     ("batch_spec", "num_speculative_tokens", "num_decode_draft_tokens_cpu"),
     [

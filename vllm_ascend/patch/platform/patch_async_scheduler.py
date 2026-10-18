@@ -19,6 +19,13 @@ def _update_request_with_output(
     if not is_stale:
         request.num_output_placeholders -= len(new_token_ids)
         assert request.num_output_placeholders >= 0
+        if (
+            not stopped
+            and request.num_output_placeholders == 0
+            and request.request_id
+            in getattr(self, "_speculation_pending_request_ids", ())
+        ):
+            self._activate_request_speculation(request)
 
     # Cache the new tokens. Preempted requests should be skipped.
     if status_before_update == RequestStatus.RUNNING:

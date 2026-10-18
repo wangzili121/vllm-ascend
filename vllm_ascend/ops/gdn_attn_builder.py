@@ -553,7 +553,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         spec_sequence_indices: torch.Tensor | None = None
         non_spec_sequence_indices: torch.Tensor | None = None
         non_spec_conv1d_cache_indices: torch.Tensor | None = None
-        if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+        if (
+            not self.use_spec_decode
+            or num_decode_draft_tokens_cpu is None
+            or not torch.any(num_decode_draft_tokens_cpu > 0).item()
+        ):
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:

@@ -151,6 +151,7 @@ class NPUModelRunner310(NPUModelRunner):
         allow_microbatching: bool = False,
         force_eager: bool = False,
         force_uniform_decode: bool | None = None,
+        force_uniform_decode_query_len: int | None = None,
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
@@ -187,6 +188,7 @@ class NPUModelRunner310(NPUModelRunner):
             allow_microbatching=allow_microbatching,
             force_eager=force_eager,
             force_uniform_decode=force_uniform_decode,
+            force_uniform_decode_query_len=force_uniform_decode_query_len,
             force_has_lora=force_has_lora,
             force_num_active_loras=force_num_active_loras,
             num_encoder_reqs=num_encoder_reqs,
@@ -584,6 +586,7 @@ class NPUModelRunner310(NPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         skip_gdn_state_update: bool = False,
+        uniform_decode_query_len: int | None = None,
     ):
         temporary_context = self.temporary_modify_uniform_decode_query_len() if uniform_decode else nullcontext()
         # All the spec decoding cases has to run splitfuse op on 310P.
@@ -611,6 +614,7 @@ class NPUModelRunner310(NPUModelRunner):
                     num_active_loras=num_active_loras,
                     profile_seq_lens=profile_seq_lens,
                     skip_gdn_state_update=skip_gdn_state_update,
+                    uniform_decode_query_len=uniform_decode_query_len,
                 )
             finally:
                 self._spec_dummy_capture = False

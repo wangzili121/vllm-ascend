@@ -257,7 +257,8 @@ def test_balance_scheduler_does_not_import_sfr_when_disabled(monkeypatch):
 def _schedule_body_ast(source: str) -> str:
     """Return a canonical AST for comparison with the pinned release tag.
 
-    This strips the 2 balance deltas and normalizes the known API differences
+    This strips the balance deltas and external-speculation fence, then
+    normalizes the known API differences
     between the release tag and the main-verified vLLM commit: connector-aware
     prefix-cache lookup/stat accounting, the equivalent ``prefill_stats``
     truthiness check, and encoder-cache connector metadata.
@@ -288,6 +289,8 @@ def _schedule_body_ast(source: str) -> str:
                 return None
             # delta 2: the balance admission gate inside the WAITING loop.
             if "balance_queue" in test and "max_num_running_reqs" in test:
+                return None
+            if "_request_waiting_for_speculation" in test:
                 return None
             # Main uses a connector-aware local cache lookup while the release
             # tag has a Mamba-specific lookup. Their common external-cache and

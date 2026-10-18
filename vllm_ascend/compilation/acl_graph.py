@@ -3,10 +3,10 @@
 
 import dataclasses
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar
 from unittest.mock import patch
 
 import torch
@@ -293,23 +293,74 @@ def update_full_graph_params(
     )
 
 
+GraphParamKey = int | BatchDescriptor
+_GraphParamValue = TypeVar("_GraphParamValue")
+
+
+class GraphParamStore(dict[GraphParamKey, _GraphParamValue], Generic[_GraphParamValue]):
+    """Graph parameter storage keyed by the complete FULL graph shape.
+
+    Attention backends historically address graph parameters by ``num_tokens``.
+    That is sufficient for PIECEWISE graphs, but two FULL graphs can have the
+    same token count and different request shapes. Resolve those legacy integer
+    lookups through the active forward context when a descriptor-specific entry
+    exists.
+    """
+
+    @staticmethod
+    def _active_descriptor() -> BatchDescriptor | None:
+        try:
+            forward_context = get_forward_context()
+        except (AssertionError, LookupError, RuntimeError):
+            return None
+        if forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+            return None
+        return forward_context.batch_descriptor
+
+    def _resolve_key(self, key: GraphParamKey) -> GraphParamKey:
+        if not isinstance(key, int):
+            return key
+        descriptor = self._active_descriptor()
+        if (
+            descriptor is not None
+            and descriptor.num_tokens == key
+            and dict.__contains__(self, descriptor)
+        ):
+            return descriptor
+        return key
+
+    def __getitem__(self, key: GraphParamKey) -> _GraphParamValue:
+        return dict.__getitem__(self, self._resolve_key(key))
+
+    def __setitem__(self, key: GraphParamKey, value: _GraphParamValue) -> None:
+        dict.__setitem__(self, self._resolve_key(key), value)
+
+    def get(
+        self,
+        key: GraphParamKey,
+        default: _GraphParamValue | None = None,
+    ) -> _GraphParamValue | None:
+        return dict.get(self, self._resolve_key(key), default)
+
+
 @dataclass
 class GraphParams:
-    events: dict[int, list[torch.npu.ExternalEvent]]
-    workspaces: dict[int, torch.Tensor | None]
-    handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
-    attn_params: dict[int, list[tuple]]
+    events: GraphParamStore[list[torch.npu.ExternalEvent]]
+    workspaces: GraphParamStore[torch.Tensor | None]
+    handles: GraphParamStore[list[torch_npu._C._NPUTaskGroupHandle]]
+    attn_params: GraphParamStore[list[tuple]]
 
 
 GraphParamsByLoRA = dict[bool, GraphParams]
 
 
-def _new_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
+def _new_graph_params(graph_keys: Iterable[GraphParamKey]) -> GraphParams:
+    graph_keys = list(graph_keys)
     return GraphParams(
-        {size: [] for size in aclgraph_capture_sizes},
-        {size: None for size in aclgraph_capture_sizes},
-        {size: [] for size in aclgraph_capture_sizes},
-        {size: [] for size in aclgraph_capture_sizes},
+        GraphParamStore({key: [] for key in graph_keys}),
+        GraphParamStore({key: None for key in graph_keys}),
+        GraphParamStore({key: [] for key in graph_keys}),
+        GraphParamStore({key: [] for key in graph_keys}),
     )
 
 
@@ -338,11 +389,12 @@ def iter_graph_params():
 _graph_params: GraphParamsByLoRA | None = None
 
 
-def set_graph_params(aclgraph_capture_sizes: list[int]):
+def set_graph_params(graph_keys: Iterable[GraphParamKey]):
     global _graph_params
     if _graph_params is not None:
         raise ValueError("Graph parameters have already been set!")
-    _graph_params = {has_lora: _new_graph_params(aclgraph_capture_sizes) for has_lora in (False, True)}
+    graph_keys = list(graph_keys)
+    _graph_params = {has_lora: _new_graph_params(graph_keys) for has_lora in (False, True)}
 
 
 def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
