@@ -1,7 +1,10 @@
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.third_party.flash_linear_attention.ops import index as fla_index
 
-from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
+from vllm_ascend._310p.ops.fla.gdn_310 import (
+    AscendGatedDeltaNetAttention310,
+    validate_gdn_speculative_tokens_310,
+)
 from vllm_ascend._310p.ops.fla.idex import (
     prepare_chunk_indices_310,
     prepare_chunk_offsets_310,
@@ -10,6 +13,14 @@ from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecode
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 from vllm_ascend.utils import is_rc_device
+
+
+_qwen_get_state_shape = QwenGatedDeltaNetAttention.get_state_shape
+
+
+def _get_qwen_state_shape_310(self):
+    validate_gdn_speculative_tokens_310(self.num_spec)
+    return _qwen_get_state_shape(self)
 
 fla_index.prepare_chunk_indices = prepare_chunk_indices_310
 fla_index.prepare_chunk_offsets = prepare_chunk_offsets_310
@@ -32,6 +43,7 @@ QwenGatedDeltaNetAttention._split_ba_for_tp = AscendGatedDeltaNetAttention._spli
 QwenGatedDeltaNetAttention.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
 QwenGatedDeltaNetAttention._forward_core = AscendGatedDeltaNetAttention310._forward_core
 QwenGatedDeltaNetAttention.get_state_dtype = AscendGatedDeltaNetAttention310.get_state_dtype
+QwenGatedDeltaNetAttention.get_state_shape = _get_qwen_state_shape_310
 
 # 310P: make Qwen GDN use the 310P attention backend, including the
 # MTP ACL graph padding replay fixes provided by gdn_attn_builder_310.py.

@@ -80,6 +80,35 @@ def test_graph_params_use_base_storage_outside_full_graph() -> None:
     assert piecewise_params is no_context_params
 
 
+def test_graph_params_distinguish_full_graphs_with_equal_token_counts() -> None:
+    decode_desc = BatchDescriptor(num_tokens=8, num_reqs=8, uniform=True)
+    verify_desc = BatchDescriptor(num_tokens=8, num_reqs=1, uniform=True)
+    set_graph_params([decode_desc, verify_desc])
+
+    with patch(
+        "vllm_ascend.compilation.acl_graph.get_forward_context",
+        return_value=SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+            batch_descriptor=decode_desc,
+        ),
+    ):
+        graph_params = get_graph_params()
+        graph_params.events[8].append("decode")
+
+    with patch(
+        "vllm_ascend.compilation.acl_graph.get_forward_context",
+        return_value=SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+            batch_descriptor=verify_desc,
+        ),
+    ):
+        graph_params = get_graph_params()
+        graph_params.events[8].append("verify")
+
+    assert graph_params.events[decode_desc] == ["decode"]
+    assert graph_params.events[verify_desc] == ["verify"]
+
+
 def test_workspace_update_targets_the_active_route() -> None:
     set_graph_params([4])
     base_workspace = torch.empty(1)

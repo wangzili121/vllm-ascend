@@ -32,6 +32,21 @@ from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
 
 
+# Keep this in sync with MAX_MTP in recurrent_gated_delta_rule_v310.h.
+MAX_RECURRENT_TOKENS_310 = 8
+
+
+def validate_gdn_speculative_tokens_310(num_speculative_tokens: int) -> None:
+    recurrent_tokens = num_speculative_tokens + 1
+    if recurrent_tokens > MAX_RECURRENT_TOKENS_310:
+        raise ValueError(
+            "310P Qwen GDN supports at most "
+            f"{MAX_RECURRENT_TOKENS_310 - 1} speculative tokens per step; "
+            f"got {num_speculative_tokens}. The recurrent kernel processes "
+            f"at most {MAX_RECURRENT_TOKENS_310} target tokens per request."
+        )
+
+
 def _zero_padded_tokens(
     tensor: torch.Tensor,
     valid_tokens: torch.Tensor,

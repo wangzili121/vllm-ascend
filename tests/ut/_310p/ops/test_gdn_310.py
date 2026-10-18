@@ -17,6 +17,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -24,6 +25,7 @@ from vllm_ascend._310p.ops.fla.gdn_310 import (
     AscendGatedDeltaNetAttention310,
     _mask_padded_recurrent_accepted_tokens,
     _zero_padded_tokens,
+    validate_gdn_speculative_tokens_310,
 )
 from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
     AscendGDNAttentionBackend310,
@@ -34,6 +36,21 @@ from vllm_ascend._310p.ops.gdn_attn_builder_310 import (
 def test_ascend_gdn_attention_310_uses_310p_backend():
     assert AscendGatedDeltaNetAttention310.get_attn_backend(object()) is AscendGDNAttentionBackend310
     assert AscendGDNAttentionBackend310.get_builder_cls() is AscendGDNAttentionMetadataBuilder310
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 1, 7])
+def test_validate_gdn_speculative_tokens_310_accepts_supported_widths(
+    num_speculative_tokens,
+):
+    validate_gdn_speculative_tokens_310(num_speculative_tokens)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [8, 15, 28])
+def test_validate_gdn_speculative_tokens_310_rejects_unsupported_widths(
+    num_speculative_tokens,
+):
+    with pytest.raises(ValueError, match="at most 7 speculative tokens"):
+        validate_gdn_speculative_tokens_310(num_speculative_tokens)
 
 
 def test_zero_padded_tokens_masks_only_padded_token_positions():
