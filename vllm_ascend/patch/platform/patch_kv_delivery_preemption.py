@@ -128,6 +128,10 @@ class KVDeliveryScheduler(Scheduler):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
+            if self._request_waiting_for_speculation(request.request_id):
+                req_index += 1
+                continue
+
             if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).

@@ -475,10 +475,10 @@ class NPUModelRunner(GPUModelRunner):
         self.enable_enpu = _enpu is not None and _enpu.lower() == "true"
 
         self._set_up_drafter()
-        if self.uses_device_custom_proposer:
+        if getattr(self, "uses_external_device_custom_proposer", False):
             # A custom proposer commonly returns no draft, leaving ordinary
             # one-token decode. Keep that hot path on the q_len=1 graph; steps
-            # with an actual draft are dispatched as non-uniform K+1 batches.
+            # with an actual draft use the separately captured K+1 graph.
             self.cudagraph_dispatcher.uniform_decode_query_len = 1
             logger.info_once(
                 "Device custom proposer uses q_len=1 for the uniform decode graph."
@@ -675,8 +675,15 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculative_config.method == "custom_class"
         )
 
+    def _bookkeeping_caches_async_sampled_tokens(self) -> bool:
+        """Whether bookkeeping, rather than the drafter, owns token caching."""
+        return self.num_spec_tokens <= 0 or (
+            self.uses_external_device_custom_proposer
+            and not self._device_custom_admitted_request_ids
+        )
+
     def _graph_uniform_decode_query_len(self) -> int:
-        if getattr(self, "uses_device_custom_proposer", False):
+        if getattr(self, "uses_external_device_custom_proposer", False):
             return 1
         return self.uniform_decode_query_len
 
@@ -1165,12 +1172,12 @@ class NPUModelRunner(GPUModelRunner):
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
         valid_sampled_token_count_gpu = self.valid_sampled_token_count_gpu
-        if self.use_async_spec_decode:
+        if self._async_spec_decode_batch_active:
             computed_token_tensor_cpu = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
             )
         if (
-            self.use_async_spec_decode
+            self._async_spec_decode_batch_active
             and valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         ):
@@ -1203,7 +1210,7 @@ class NPUModelRunner(GPUModelRunner):
         dcp_manager = getattr(self, "dcp_manager", None)
         if dcp_manager is not None:
             cp_async_rebuild = dcp_manager.rebuild_async_spec_decode_inputs(
-                use_async_spec_decode=self.use_async_spec_decode,
+                use_async_spec_decode=self._async_spec_decode_batch_active,
                 valid_sampled_token_count_gpu=valid_sampled_token_count_gpu,
                 prev_req_id_to_index=prev_req_id_to_index,
                 prev_positions_gpu=prev_positions_gpu,
@@ -1270,7 +1277,7 @@ class NPUModelRunner(GPUModelRunner):
         # NPU->CPU seq_lens copy and the synchronize() in attention metadata.
         # Mirrors update_num_computed_tokens_for_batch_change on the GPU side.
         async_spec_decode_active = (
-            self.use_async_spec_decode
+            self._async_spec_decode_batch_active
             and valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         )
@@ -1283,7 +1290,9 @@ class NPUModelRunner(GPUModelRunner):
             self.positions[:total_num_scheduled_tokens],
         )
 
-        if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
+        if self._async_spec_decode_batch_active and (
+            self.uses_mrope or self.uses_xdrope_dim > 0
+        ):
             drift = self.num_computed_tokens[req_indices_gpu].to(
                 torch.int64
             ) - computed_token_tensor_cpu[req_indices_gpu]
@@ -1508,7 +1517,7 @@ class NPUModelRunner(GPUModelRunner):
             counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
 
-        if self.use_async_spec_decode:
+        if self._async_spec_decode_batch_active:
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
@@ -1541,9 +1550,11 @@ class NPUModelRunner(GPUModelRunner):
         sampled_token_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = self.input_batch.num_reqs
+        assert self._device_custom_token_ids_gpu is not None
+        assert self._device_custom_history_lengths_gpu is not None
         return append_sampled_tokens(
-            self.token_ids_gpu_tensor[:batch_size],
-            self.num_tokens_no_spec_gpu[:batch_size],
+            self._device_custom_token_ids_gpu[:batch_size],
+            self._device_custom_history_lengths_gpu[:batch_size],
             sampled_token_ids,
             self.discard_request_mask.gpu[:batch_size],
             vocab_size=self.model_config.get_vocab_size(),
@@ -1571,6 +1582,11 @@ class NPUModelRunner(GPUModelRunner):
             draft_token_ids = None
         elif self._uses_custom_class_proposer():
             if self.uses_device_custom_proposer:
+                if (
+                    self.uses_external_device_custom_proposer
+                    and not self._device_custom_admitted_request_ids
+                ):
+                    return None
                 assert isinstance(valid_sampled_token_ids, torch.Tensor)
                 draft_token_ids = self._propose_device_custom(
                     valid_sampled_token_ids,
@@ -1874,8 +1890,37 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
        
-        # Device proposers trim optimistic draft slots in the local copy.
-        if getattr(self, "uses_device_token_history", False):
+        custom_proposer_updates = getattr(
+            scheduler_output, "custom_proposer_updates", ()
+        )
+        if getattr(self, "uses_external_device_custom_proposer", False):
+            admitted_request_ids = frozenset(
+                getattr(
+                    scheduler_output, "custom_proposer_request_ids", ()
+                )
+            )
+            newly_admitted = admitted_request_ids.difference(
+                self._device_custom_admitted_request_ids
+            )
+            self._device_custom_history_pending_init.update(newly_admitted)
+            authoritative_histories = (
+                scheduler_output.scheduled_cached_reqs.all_token_ids
+            )
+            for request_id in newly_admitted:
+                token_ids = authoritative_histories.get(request_id)
+                if token_ids is not None:
+                    self._device_custom_history_snapshots[request_id] = token_ids
+            self._device_custom_admitted_request_ids = admitted_request_ids
+        self._update_async_spec_decode_batch_state(scheduler_output)
+        # Device proposers trim optimistic draft slots in the local copy. An
+        # inactive external proposer follows the ordinary decode path until a
+        # registration update activates it at this step boundary.
+        needs_mutable_spec_state = getattr(
+            self, "uses_device_token_history", False
+        ) and bool(
+            scheduler_output.scheduled_spec_decode_tokens
+        )
+        if needs_mutable_spec_state:
             num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
             spec_decode_tokens_copy = (
                 scheduler_output.scheduled_spec_decode_tokens.copy()
@@ -1895,8 +1940,12 @@ class NPUModelRunner(GPUModelRunner):
         # number of requests, optimize it later.
         if (
             self.use_async_scheduling
-            and self.num_spec_tokens
+            and self._async_spec_decode_batch_active
             and self._draft_token_ids is None  # type: ignore[has-type]
+            and (
+                not self.uses_external_device_custom_proposer
+                or bool(self._device_custom_admitted_request_ids)
+            )
         ):
             scheduler_output = deepcopy(scheduler_output)
         pp_group = get_pp_group()
@@ -1924,7 +1973,7 @@ class NPUModelRunner(GPUModelRunner):
                 # requests so they fall through safely.
                 if (
                     self.use_async_scheduling
-                    and self.num_spec_tokens
+                    and self._async_spec_decode_batch_active
                     and self.input_batch.prev_req_id_to_index is not None
                 ):
                     for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
@@ -1935,16 +1984,12 @@ class NPUModelRunner(GPUModelRunner):
                         ):
                             req_state.prev_num_draft_len = 0
 
+                # Capture the scheduler frame before _update_states trims
+                # invalid optimistic draft slots from its local copy.
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
-                custom_proposer_updates = getattr(
-                    scheduler_output,
-                    "custom_proposer_updates",
-                    (),
-                )
-
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data()
                     with self.maybe_get_ec_connector_output(
@@ -2030,7 +2075,11 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
-                if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
+                if (
+                    self.cascade_attn_enabled
+                    and not self.parallel_config.enable_dbo
+                    and not self._async_spec_decode_batch_active
+                ):
                     # Pre-compute cascade attention prefix lengths
                     cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                         num_scheduled_tokens_np,
@@ -2205,8 +2254,9 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        defer_kv_connector_finalize = self.speculative_config is not None and (
-            get_pp_group().is_last_rank or self.broadcast_pp_output
+        defer_kv_connector_finalize = (
+            self._should_defer_kv_connector_finalize()
+            and (get_pp_group().is_last_rank or self.broadcast_pp_output)
         )
         with (
             record_function_or_nullcontext("forward"),
@@ -2371,7 +2421,12 @@ class NPUModelRunner(GPUModelRunner):
 
         self.valid_sampled_token_count_gpu = None
 
+        custom_proposer_request_ids: tuple[str, ...] = ()
+        custom_proposer_ready_lengths: torch.Tensor | None = None
+
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal custom_proposer_request_ids
+            nonlocal custom_proposer_ready_lengths
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
@@ -2386,12 +2441,24 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            if self.uses_device_custom_proposer:
+                assert self._device_custom_ready_lengths is not None
+                custom_proposer_request_ids = tuple(self.input_batch.req_ids)
+                custom_proposer_ready_lengths = (
+                    self._device_custom_ready_lengths.clone()
+                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         output_spec_token_ids = None
+        run_drafter = self.speculative_config is not None and (
+            not self.uses_device_custom_proposer
+            or not self.uses_external_device_custom_proposer
+            or bool(self._device_custom_admitted_request_ids)
+        )
         use_padded_batch = False
         early_pp_padded_drafter = False
-        if self.speculative_config:
+        if run_drafter:
+            assert self.speculative_config is not None
             use_padded_batch = (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
@@ -2427,7 +2494,8 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config:
+            if run_drafter:
+                assert self.speculative_config is not None
                 if not early_pp_padded_drafter:
                     self._draft_token_ids = None
                     self._draft_token_req_ids = None
@@ -2435,7 +2503,7 @@ class NPUModelRunner(GPUModelRunner):
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                if not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -2443,7 +2511,7 @@ class NPUModelRunner(GPUModelRunner):
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
-            if self.speculative_config is not None:
+            if self._should_defer_kv_connector_finalize():
                 self.finalize_kv_connector()
 
             draft_token_ids = self._draft_token_ids if use_pp_spec_decode else None
@@ -2538,6 +2606,8 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
             routed_experts=routed_experts_snapshot,
+            custom_proposer_request_ids=custom_proposer_request_ids,
+            custom_proposer_ready_lengths=custom_proposer_ready_lengths,
         )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
@@ -2654,7 +2724,7 @@ class NPUModelRunner(GPUModelRunner):
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
-            if self.num_spec_tokens <= 0:
+            if self._bookkeeping_caches_async_sampled_tokens():
                 assert sampled_token_ids.shape[-1] == 1
                 # Cache the sampled tokens on the NPU and avoid CPU sync.
                 # These will be copied into input_ids in the next step
@@ -2869,13 +2939,20 @@ class NPUModelRunner(GPUModelRunner):
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
         # be improved in model runner v2)
         force_uniform_decode: bool | None = None,
+        force_uniform_decode_query_len: int | None = None,
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        graph_query_len = self._graph_uniform_decode_query_len()
+        graph_query_len = (
+            force_uniform_decode_query_len
+            if force_uniform_decode_query_len is not None
+            else self._get_runtime_uniform_decode_query_len(
+                max_num_scheduled_tokens
+            )
+        )
         uniform_decode = (
             (
                 (is_all_decode if self.speculative_config else True)
@@ -2904,6 +2981,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
+                uniform_decode_query_len=graph_query_len,
                 valid_modes=valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
                 num_active_loras=num_active_loras,
@@ -3012,7 +3090,7 @@ class NPUModelRunner(GPUModelRunner):
                 return None, block_table_tensor
 
             fixed_decode_seq_lens_cpu = None
-            if self.use_async_spec_decode:
+            if self._async_spec_decode_batch_active:
                 fixed_decode_seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs].numpy()
 
             assert num_reqs_padded is not None
@@ -3073,7 +3151,7 @@ class NPUModelRunner(GPUModelRunner):
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
         is_prefilling[num_reqs:] = False
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
-        if self.use_async_spec_decode:
+        if self._async_spec_decode_batch_active:
             # GPU tensors are authoritative in async mode.
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
@@ -3340,6 +3418,7 @@ class NPUModelRunner(GPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         skip_gdn_state_update: bool = False,
+        uniform_decode_query_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3356,11 +3435,12 @@ class NPUModelRunner(GPUModelRunner):
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = (
-            self._graph_uniform_decode_query_len()
-            if uniform_decode
-            else num_tokens
-        )
+        max_query_len = num_tokens
+        if uniform_decode:
+            max_query_len = (
+                uniform_decode_query_len
+                or self._graph_uniform_decode_query_len()
+            )
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
@@ -3404,6 +3484,9 @@ class NPUModelRunner(GPUModelRunner):
             # num_tokens == num_reqs which looks like a uniform decode batch to the
             # dispatcher; but we actually want to capture a piecewise cudagraph
             force_uniform_decode=uniform_decode,
+            force_uniform_decode_query_len=(
+                max_query_len if uniform_decode else None
+            ),
             # `force_has_lora` is used for cudagraph capture; because LoRA is
             # activated later in the context manager, but we need to know the
             # LoRA state when determining the batch descriptor for capture
@@ -3575,8 +3658,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
             need_dummy_logits = not is_profile and lmhead_tp_enable()
+            lmhead_query_len = (
+                uniform_decode_query_len
+                or self._graph_uniform_decode_query_len()
+            )
             max_num_reqs_across_dp = (
-                max_num_reqs * self._graph_uniform_decode_query_len()
+                max_num_reqs * lmhead_query_len
             )
             dummy_indices = torch.zeros(max_num_reqs_across_dp, dtype=torch.int32)
 
@@ -5062,7 +5149,12 @@ class NPUModelRunner(GPUModelRunner):
                 max_num_reqs=self.max_num_reqs,
             )
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
-                cudagraph_mode, graph_query_len
+                cudagraph_mode,
+                graph_query_len,
+                self._get_additional_uniform_decode_query_lens(
+                    self.num_spec_tokens,
+                    self.uses_external_device_custom_proposer,
+                ),
             )
 
         if (
@@ -5080,6 +5172,11 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+        graph_param_keys = [
+            desc if mode == CUDAGraphMode.FULL else desc.num_tokens
+            for mode, descs in capture_descs
+            for desc in descs
+        ]
         capture_sizes = sorted({
             desc.num_tokens
             for _, descs in capture_descs
@@ -5089,7 +5186,7 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE: Since aclgraph_batch_sizes cannot be determined until here,
         # we set the graph params right before initializing the keys.
         if self.use_aclgraph:
-            set_graph_params(capture_sizes)
+            set_graph_params(graph_param_keys)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
