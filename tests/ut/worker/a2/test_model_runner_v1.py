@@ -80,7 +80,7 @@ class TestCustomClassProposer(unittest.TestCase):
         )
         self.assertEqual(
             runner._get_additional_uniform_decode_query_lens(7, True),
-            {8: 1},
+            {6: 1, 8: 1},
         )
 
     def test_device_custom_proposer_uses_upstream_async_path(self):
