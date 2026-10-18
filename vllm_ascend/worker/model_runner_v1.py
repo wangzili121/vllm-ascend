@@ -687,6 +687,29 @@ class NPUModelRunner(GPUModelRunner):
             return 1
         return self.uniform_decode_query_len
 
+    def _dummy_uses_spec_decode(
+        self,
+        uniform_decode: bool,
+        uniform_decode_query_len: int,
+    ) -> bool:
+        return bool(
+            self.speculative_config
+            and uniform_decode
+            and uniform_decode_query_len > 1
+        )
+
+    @contextmanager
+    def _temporary_dummy_async_spec_decode_state(
+        self, use_spec_decode: bool
+    ):
+        original = self._async_spec_decode_batch_active
+        if self.uses_external_device_custom_proposer:
+            self._async_spec_decode_batch_active = use_spec_decode
+        try:
+            yield
+        finally:
+            self._async_spec_decode_batch_active = original
+
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
 
@@ -3441,6 +3464,10 @@ class NPUModelRunner(GPUModelRunner):
                 uniform_decode_query_len
                 or self._graph_uniform_decode_query_len()
             )
+        use_spec_decode = self._dummy_uses_spec_decode(
+            uniform_decode,
+            max_query_len,
+        )
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
@@ -3471,6 +3498,12 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        if use_spec_decode:
+            self.num_decode_draft_tokens.np[:num_reqs].fill(
+                max_query_len - 1
+            )
+            self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+            self.num_decode_draft_tokens.copy_to_gpu()
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -3591,17 +3624,25 @@ class NPUModelRunner(GPUModelRunner):
                 if self.use_compress:
                     self.positions.fill_(127)
                     self._dsa_positions_cpu_buf.fill_(127)
-                attn_metadata, _ = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    max_query_len=max_query_len,
-                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                    for_cudagraph_capture=is_graph_capturing,
-                    num_scheduled_tokens_np=num_scheduled_tokens,
-                    skip_gdn_state_update=skip_gdn_state_update,
-                )
+                with self._temporary_dummy_async_spec_decode_state(
+                    use_spec_decode
+                ):
+                    attn_metadata, _ = self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded,
+                        max_query_len=max_query_len,
+                        ubatch_slices=(
+                            ubatch_slices_padded
+                            if pad_attn
+                            else ubatch_slices
+                        ),
+                        for_cudagraph_capture=is_graph_capturing,
+                        num_scheduled_tokens_np=num_scheduled_tokens,
+                        skip_gdn_state_update=skip_gdn_state_update,
+                        use_spec_decode=use_spec_decode,
+                    )
                 if not is_graph_capturing:
                     for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
                         blk_table = self.input_batch.block_table[kv_cache_gid]

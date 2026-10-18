@@ -83,6 +83,30 @@ class TestCustomClassProposer(unittest.TestCase):
             {6: 1, 8: 1},
         )
 
+    def test_dummy_graph_uses_spec_metadata_only_for_verification(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(method="custom_class")
+
+        self.assertFalse(runner._dummy_uses_spec_decode(True, 1))
+        self.assertTrue(runner._dummy_uses_spec_decode(True, 6))
+        self.assertFalse(runner._dummy_uses_spec_decode(False, 6))
+
+        runner.speculative_config = None
+        self.assertFalse(runner._dummy_uses_spec_decode(True, 6))
+
+    def test_dummy_graph_matches_runtime_async_spec_state(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.uses_external_device_custom_proposer = True
+        runner._async_spec_decode_batch_active = True
+
+        with runner._temporary_dummy_async_spec_decode_state(False):
+            self.assertFalse(runner._async_spec_decode_batch_active)
+        self.assertTrue(runner._async_spec_decode_batch_active)
+
+        runner.uses_external_device_custom_proposer = False
+        with runner._temporary_dummy_async_spec_decode_state(False):
+            self.assertTrue(runner._async_spec_decode_batch_active)
+
     def test_device_custom_proposer_uses_upstream_async_path(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.speculative_config = SimpleNamespace(method="custom_class")
