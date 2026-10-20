@@ -34,6 +34,34 @@ def main() -> None:
     assert history[0, :3].cpu().tolist() == [10, 11, 12]
     assert int(history[1, 31].cpu()) == 40
     assert history[2, :3].cpu().tolist() == [20, 21, 0]
+
+    # Async sampling can return a narrow view whose row stride is larger than
+    # its visible width. Every request must read from its own physical row.
+    strided_source = torch.full(
+        (4, 8), -1, dtype=torch.int32, device=device
+    )
+    strided_source[:, 0] = torch.tensor(
+        [70, 71, 72, 73], dtype=torch.int32, device=device
+    )
+    strided_sampled = strided_source[:, :1]
+    assert not strided_sampled.is_contiguous()
+
+    strided_history = torch.zeros((4, 8), dtype=torch.int32, device=device)
+    strided_lengths = torch.zeros(4, dtype=torch.int32, device=device)
+    strided_discarded = torch.zeros(4, dtype=torch.bool, device=device)
+    strided_next, strided_counts, strided_updated = append_sampled_tokens(
+        strided_history,
+        strided_lengths,
+        strided_sampled,
+        strided_discarded,
+        vocab_size=100,
+        max_sequence_length=4,
+    )
+
+    assert strided_next.cpu().tolist() == [70, 71, 72, 73]
+    assert strided_counts.cpu().tolist() == [1, 1, 1, 1]
+    assert strided_updated.cpu().tolist() == [1, 1, 1, 1]
+    assert strided_history[:, 0].cpu().tolist() == [70, 71, 72, 73]
     print("token history smoke passed", {"device": device})
 
 

@@ -12,6 +12,8 @@ def append_sampled_tokens_kernel(
     valid_counts_ptr,
     updated_lengths_ptr,
     history_stride: tl.constexpr,
+    sampled_row_stride: tl.constexpr,
+    sampled_column_stride: tl.constexpr,
     max_sequence_length: tl.constexpr,
     max_new_tokens: tl.constexpr,
     block_size: tl.constexpr,
@@ -22,7 +24,9 @@ def append_sampled_tokens_kernel(
     offsets = tl.arange(0, block_size)
     in_sample = offsets < max_new_tokens
     sampled = tl.load(
-        sampled_ptr + row * max_new_tokens + offsets,
+        sampled_ptr
+        + row * sampled_row_stride
+        + offsets * sampled_column_stride,
         mask=in_sample,
         other=-1,
     )
@@ -87,6 +91,8 @@ def append_sampled_tokens(
         valid_counts,
         updated_lengths,
         history_stride=token_ids.shape[1],
+        sampled_row_stride=sampled_token_ids.stride(0),
+        sampled_column_stride=sampled_token_ids.stride(1),
         max_sequence_length=max_sequence_length,
         max_new_tokens=max_new_tokens,
         block_size=block_size,
